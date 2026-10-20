@@ -1,3 +1,37 @@
-var vals = $('#P30_OP_SEQ option').map(function () { return this.value; }).get()
-             .filter(function (v) { return v !== ''; });
-if (vals.length === 1) { apex.item('P30_OP_SEQ').setValue(vals[0]); }
+DECLARE
+  v_id NUMBER;
+BEGIN
+  v_id := insp_api.submit_ticket(:APP_USER, :P30_COMMENT);
+
+  INSERT INTO insp_attachments (ticket_id, file_name, mime_type, file_size, file_blob, uploaded_by)
+  SELECT v_id, f.filename, f.mime_type, DBMS_LOB.GETLENGTH(f.blob_content), f.blob_content, :APP_USER
+  FROM   apex_application_temp_files f
+  WHERE  f.name IN (SELECT column_value FROM TABLE(apex_string.split(:P30_FILES, ':')));
+
+  apex_application.g_print_success_message := 'Inspection ticket ' || v_id || ' submitted.';
+END;
+
+
+next one 
+
+SELECT t.id                 AS ticket_no,
+       t.status,
+       t.priority,
+       t.requested_ts       AS submitted,
+       t.assigned_inspector AS inspector,
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
+       (SELECT LISTAGG(l.job || ' / ' || l.op_seq, ', ') WITHIN GROUP (ORDER BY l.line_no)
+        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS job_list
+FROM   insp_tickets t
+WHERE  UPPER(t.requested_by) = UPPER(:APP_USER)
+ORDER  BY t.id DESC
+
+
+
+next one
+SELECT 'ticket' AS what, COUNT(*) AS n FROM insp_tickets
+UNION ALL SELECT 'lines', COUNT(*) FROM insp_ticket_lines
+UNION ALL SELECT 'events', COUNT(*) FROM insp_events
+UNION ALL SELECT 'comments', COUNT(*) FROM insp_comments
+UNION ALL SELECT 'files', COUNT(*) FROM insp_attachments
+

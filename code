@@ -1,9 +1,4 @@
--- =============================================================================
--- GDLS OMS | App 260 | GD_SANDBOX
--- Package INSP_API - every action of the Inspection & Forklift module.
--- Pages call these procedures; rules, permissions and time stamps live here.
--- Run ONCE in SQL Workshop -> SQL Scripts. Re-running is safe (CREATE OR REPLACE).
--- =============================================================================
+
 
 CREATE OR REPLACE PACKAGE insp_api AS
 

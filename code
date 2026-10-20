@@ -1,20 +1,3 @@
-SELECT c.seq_id,
-       c.c001            AS job,
-       c.n001            AS op_seq,
-       q.assy_description,
-       q.op_description,
-       q.dept,
-       c.n002            AS qty,
-       l.location_name   AS location,
-       c.seq_id          AS remove
-FROM   apex_collections c
-LEFT JOIN (SELECT job, op_seq,
-                  MAX(assy_description) AS assy_description,
-                  MAX(op_description)   AS op_description,
-                  MAX(dept)             AS dept
-           FROM   mq_material_queue
-           GROUP  BY job, op_seq) q
-       ON q.job = c.c001 AND q.op_seq = c.n001
-LEFT JOIN fl_locations_v l ON l.location_code = c.c002
-WHERE  c.collection_name = 'INSP_CART'
-ORDER  BY c.seq_id
+var vals = $('#P30_OP_SEQ option').map(function () { return this.value; }).get()
+             .filter(function (v) { return v !== ''; });
+if (vals.length === 1) { apex.item('P30_OP_SEQ').setValue(vals[0]); }

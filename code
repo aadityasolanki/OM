@@ -1,37 +1,653 @@
-DECLARE
-  v_id NUMBER;
-BEGIN
-  v_id := insp_api.submit_ticket(:APP_USER, :P30_COMMENT);
-
-  INSERT INTO insp_attachments (ticket_id, file_name, mime_type, file_size, file_blob, uploaded_by)
-  SELECT v_id, f.filename, f.mime_type, DBMS_LOB.GETLENGTH(f.blob_content), f.blob_content, :APP_USER
-  FROM   apex_application_temp_files f
-  WHERE  f.name IN (SELECT column_value FROM TABLE(apex_string.split(:P30_FILES, ':')));
-
-  apex_application.g_print_success_message := 'Inspection ticket ' || v_id || ' submitted.';
-END;
 
 
-next one 
+CREATE OR REPLACE PACKAGE insp_api AS
 
-SELECT t.id                 AS ticket_no,
-       t.status,
-       t.priority,
-       t.requested_ts       AS submitted,
-       t.assigned_inspector AS inspector,
-       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
-       (SELECT LISTAGG(l.job || ' / ' || l.op_seq, ', ') WITHIN GROUP (ORDER BY l.line_no)
-        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS job_list
-FROM   insp_tickets t
-WHERE  UPPER(t.requested_by) = UPPER(:APP_USER)
-ORDER  BY t.id DESC
+  -- access checks (also used by APEX authorization schemes)
+  FUNCTION has_role     (p_user VARCHAR2, p_roles VARCHAR2) RETURN VARCHAR2;  -- 'Y' / 'N'
+  FUNCTION has_any_role (p_user VARCHAR2) RETURN VARCHAR2;                    -- any active Scranton role
+  FUNCTION is_driver    (p_user VARCHAR2) RETURN VARCHAR2;                    -- current Forklift qualification
+  FUNCTION role_of      (p_user VARCHAR2) RETURN VARCHAR2;
+  FUNCTION is_manager   (p_user VARCHAR2) RETURN VARCHAR2;                    -- Planner/Manager/Super User/Admin
 
+  -- comments
+  PROCEDURE add_comment (p_ticket_id NUMBER, p_fl_ticket_id NUMBER, p_line_id NUMBER,
+                         p_text VARCHAR2, p_user VARCHAR2);
 
+  -- floor operator: build a ticket ("cart" of jobs), then submit
+  PROCEDURE cart_add    (p_job VARCHAR2, p_op_seq NUMBER, p_qty NUMBER, p_location_code VARCHAR2);
+  PROCEDURE cart_remove (p_seq_id NUMBER);
+  FUNCTION  submit_ticket (p_user VARCHAR2, p_comment VARCHAR2) RETURN NUMBER;
 
-next one
-SELECT 'ticket' AS what, COUNT(*) AS n FROM insp_tickets
-UNION ALL SELECT 'lines', COUNT(*) FROM insp_ticket_lines
-UNION ALL SELECT 'events', COUNT(*) FROM insp_events
-UNION ALL SELECT 'comments', COUNT(*) FROM insp_comments
-UNION ALL SELECT 'files', COUNT(*) FROM insp_attachments
+  -- planner / manager / inspector
+  PROCEDURE set_priority      (p_ticket_id NUMBER, p_priority NUMBER, p_user VARCHAR2);
+  PROCEDURE assign_inspector  (p_ticket_id NUMBER, p_inspector VARCHAR2, p_user VARCHAR2);
+  PROCEDURE start_inspection  (p_ticket_id NUMBER, p_user VARCHAR2);
+  PROCEDURE hold_inspection   (p_ticket_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2);
+  PROCEDURE resume_inspection (p_ticket_id NUMBER, p_user VARCHAR2);
+  PROCEDURE result_line       (p_line_id NUMBER, p_result VARCHAR2, p_user VARCHAR2,
+                               p_note VARCHAR2 DEFAULT NULL, p_to_location VARCHAR2 DEFAULT NULL);
+  PROCEDURE close_failed_line (p_line_id NUMBER, p_user VARCHAR2, p_note VARCHAR2);
+  PROCEDURE cancel_ticket     (p_ticket_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2);
 
+  -- forklift
+  FUNCTION  create_forklift  (p_from_location VARCHAR2, p_to_location VARCHAR2, p_user VARCHAR2,
+                              p_job VARCHAR2 DEFAULT NULL, p_op_seq NUMBER DEFAULT NULL,
+                              p_comment VARCHAR2 DEFAULT NULL, p_source VARCHAR2 DEFAULT 'FLOOR',
+                              p_line_id NUMBER DEFAULT NULL) RETURN NUMBER;
+  PROCEDURE claim_forklift   (p_fl_id NUMBER, p_user VARCHAR2);
+  PROCEDURE pickup_forklift  (p_fl_id NUMBER, p_user VARCHAR2);
+  PROCEDURE deliver_forklift (p_fl_id NUMBER, p_user VARCHAR2);
+  PROCEDURE release_forklift (p_fl_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2);
+  PROCEDURE cancel_forklift  (p_fl_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2);
+
+END insp_api;
+/
+
+CREATE OR REPLACE PACKAGE BODY insp_api AS
+
+  c_cart CONSTANT VARCHAR2(30)  := 'INSP_CART';
+  c_mgr  CONSTANT VARCHAR2(100) := 'PLANNER,MANAGER,SUPER_USER,ADMIN';  -- manager-level roles
+
+  -- ---------------------------------------------------------------- helpers
+  PROCEDURE fail (p_msg VARCHAR2) IS
+  BEGIN
+    RAISE_APPLICATION_ERROR(-20100, p_msg);
+  END;
+
+  PROCEDURE log_event (p_ticket_id NUMBER, p_line_id NUMBER, p_fl_id NUMBER,
+                       p_code VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                       p_user VARCHAR2, p_note VARCHAR2 DEFAULT NULL) IS
+  BEGIN
+    INSERT INTO insp_events (ticket_id, ticket_line_id, fl_ticket_id, event_code,
+                             from_status, to_status, event_by, note)
+    VALUES (p_ticket_id, p_line_id, p_fl_id, p_code, p_from, p_to, UPPER(p_user), p_note);
+  END;
+
+  FUNCTION has_role (p_user VARCHAR2, p_roles VARCHAR2) RETURN VARCHAR2 IS
+    n NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO n
+    FROM   app_user_roles
+    WHERE  UPPER(unixid) = UPPER(p_user)
+    AND    is_active = 'Y'
+    AND    UPPER(site) IN ('SCRANTON', 'ALL', 'ALL SITES')
+    AND    INSTR(',' || UPPER(REPLACE(p_roles, ' ', '')) || ',', ',' || UPPER(role_code) || ',') > 0;
+    RETURN CASE WHEN n > 0 THEN 'Y' ELSE 'N' END;
+  END;
+
+  FUNCTION has_any_role (p_user VARCHAR2) RETURN VARCHAR2 IS
+    n NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO n
+    FROM   app_user_roles
+    WHERE  UPPER(unixid) = UPPER(p_user)
+    AND    is_active = 'Y'
+    AND    UPPER(site) IN ('SCRANTON', 'ALL', 'ALL SITES');
+    RETURN CASE WHEN n > 0 THEN 'Y' ELSE 'N' END;
+  END;
+
+  FUNCTION is_driver (p_user VARCHAR2) RETURN VARCHAR2 IS
+    n NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO n FROM fl_eligible_drivers_v WHERE UPPER(unixid) = UPPER(p_user);
+    RETURN CASE WHEN n > 0 THEN 'Y' ELSE 'N' END;
+  END;
+
+  FUNCTION role_of (p_user VARCHAR2) RETURN VARCHAR2 IS
+    v VARCHAR2(50);
+  BEGIN
+    SELECT role_code INTO v
+    FROM   app_user_roles
+    WHERE  UPPER(unixid) = UPPER(p_user)
+    AND    is_active = 'Y'
+    AND    UPPER(site) IN ('SCRANTON', 'ALL', 'ALL SITES')
+    ORDER  BY CASE WHEN UPPER(site) = 'SCRANTON' THEN 0 ELSE 1 END
+    FETCH FIRST 1 ROW ONLY;
+    RETURN v;
+  EXCEPTION WHEN NO_DATA_FOUND THEN RETURN NULL;
+  END;
+
+  FUNCTION is_manager (p_user VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN has_role(p_user, c_mgr);
+  END;
+
+  PROCEDURE require_role (p_user VARCHAR2, p_roles VARCHAR2, p_action VARCHAR2) IS
+  BEGIN
+    IF has_role(p_user, p_roles) = 'N' THEN
+      fail('You do not have permission to ' || p_action || '.');
+    END IF;
+  END;
+
+  FUNCTION lock_ticket (p_id NUMBER) RETURN insp_tickets%ROWTYPE IS
+    r insp_tickets%ROWTYPE;
+  BEGIN
+    SELECT * INTO r FROM insp_tickets WHERE id = p_id FOR UPDATE;
+    RETURN r;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+    fail('Inspection ticket ' || p_id || ' was not found.');
+  END;
+
+  FUNCTION lock_fl (p_id NUMBER) RETURN fl_tickets%ROWTYPE IS
+    r fl_tickets%ROWTYPE;
+  BEGIN
+    SELECT * INTO r FROM fl_tickets WHERE id = p_id FOR UPDATE;
+    RETURN r;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+    fail('Forklift ticket ' || p_id || ' was not found.');
+  END;
+
+  PROCEDURE require_assignee (r insp_tickets%ROWTYPE, p_user VARCHAR2) IS
+  BEGIN
+    IF UPPER(NVL(r.assigned_inspector, '-')) <> UPPER(p_user)
+       AND has_role(p_user, c_mgr) = 'N' THEN
+      fail('Ticket ' || r.id || ' is not assigned to you.');
+    END IF;
+  END;
+
+  FUNCTION location_name (p_code VARCHAR2) RETURN VARCHAR2 IS
+    v VARCHAR2(200);
+  BEGIN
+    IF p_code IS NULL THEN RETURN NULL; END IF;
+    SELECT location_name INTO v FROM fl_locations_v WHERE location_code = p_code;
+    RETURN v;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+    fail('Location ' || p_code || ' was not found or is inactive.');
+  END;
+
+  FUNCTION open_line_ticket (p_job VARCHAR2, p_op_seq NUMBER) RETURN NUMBER IS
+    v NUMBER;
+  BEGIN
+    SELECT MIN(l.ticket_id) INTO v
+    FROM   insp_ticket_lines l
+    JOIN   insp_tickets t ON t.id = l.ticket_id
+    WHERE  l.job = p_job
+    AND    l.op_seq = p_op_seq
+    AND    l.line_status IN ('OPEN', 'FAILED')
+    AND    t.status <> 'CANCELLED';
+    RETURN v;
+  END;
+
+  PROCEDURE check_completion (p_ticket_id NUMBER, p_user VARCHAR2) IS
+    r        insp_tickets%ROWTYPE := lock_ticket(p_ticket_id);
+    v_open   NUMBER;
+    v_failed NUMBER;
+  BEGIN
+    SELECT COUNT(CASE WHEN line_status = 'OPEN'   THEN 1 END),
+           COUNT(CASE WHEN line_status = 'FAILED' THEN 1 END)
+    INTO   v_open, v_failed
+    FROM   insp_ticket_lines
+    WHERE  ticket_id = p_ticket_id;
+
+    IF v_open = 0 AND r.status IN ('IN_PROGRESS', 'ON_HOLD') THEN
+      UPDATE insp_tickets SET status = 'INSPECTED', inspected_ts = SYSTIMESTAMP WHERE id = p_ticket_id;
+      log_event(p_ticket_id, NULL, NULL, 'INSPECTED', r.status, 'INSPECTED', p_user);
+      r.status := 'INSPECTED';
+    END IF;
+
+    IF v_open = 0 AND v_failed = 0 AND r.status = 'INSPECTED' THEN
+      UPDATE insp_tickets SET status = 'CLOSED', closed_ts = SYSTIMESTAMP WHERE id = p_ticket_id;
+      log_event(p_ticket_id, NULL, NULL, 'CLOSE', 'INSPECTED', 'CLOSED', p_user);
+    END IF;
+  END;
+
+  -- ---------------------------------------------------------------- comments
+  PROCEDURE add_comment (p_ticket_id NUMBER, p_fl_ticket_id NUMBER, p_line_id NUMBER,
+                         p_text VARCHAR2, p_user VARCHAR2) IS
+    v_status VARCHAR2(20);
+    v_role   VARCHAR2(50) := role_of(p_user);
+  BEGIN
+    IF TRIM(p_text) IS NULL THEN RETURN; END IF;
+    IF p_ticket_id IS NOT NULL THEN
+      SELECT status INTO v_status FROM insp_tickets WHERE id = p_ticket_id;
+    ELSE
+      SELECT status INTO v_status FROM fl_tickets WHERE id = p_fl_ticket_id;
+    END IF;
+    INSERT INTO insp_comments (ticket_id, fl_ticket_id, ticket_line_id, comment_text,
+                               comment_by, comment_role, ticket_status)
+    VALUES (p_ticket_id, p_fl_ticket_id, p_line_id, TRIM(p_text),
+            UPPER(p_user), v_role, v_status);
+  END;
+
+  -- ---------------------------------------------------------------- cart + submit
+  PROCEDURE cart_add (p_job VARCHAR2, p_op_seq NUMBER, p_qty NUMBER, p_location_code VARCHAR2) IS
+    v_job  VARCHAR2(30) := TRIM(p_job);
+    n      NUMBER;
+    v_open NUMBER;
+  BEGIN
+    IF v_job IS NULL OR p_op_seq IS NULL THEN
+      fail('Select a job and an op sequence.');
+    END IF;
+
+    SELECT COUNT(*) INTO n FROM mq_material_queue WHERE job = v_job AND op_seq = p_op_seq;
+    IF n = 0 THEN
+      fail('Job ' || v_job || ' op ' || p_op_seq || ' is not in the current Material Queue Report.');
+    END IF;
+
+    v_open := open_line_ticket(v_job, p_op_seq);
+    IF v_open IS NOT NULL THEN
+      fail('Job ' || v_job || ' op ' || p_op_seq || ' is already on open ticket ' || v_open || '.');
+    END IF;
+
+    IF NOT apex_collection.collection_exists(c_cart) THEN
+      apex_collection.create_collection(c_cart);
+    END IF;
+
+    SELECT COUNT(*) INTO n FROM apex_collections
+    WHERE  collection_name = c_cart AND c001 = v_job AND n001 = p_op_seq;
+    IF n > 0 THEN
+      fail('Job ' || v_job || ' op ' || p_op_seq || ' is already in this ticket.');
+    END IF;
+
+    IF p_location_code IS NOT NULL THEN
+      n := LENGTH(location_name(p_location_code));   -- validates the location
+    END IF;
+
+    apex_collection.add_member(p_collection_name => c_cart,
+                               p_c001 => v_job,
+                               p_c002 => p_location_code,
+                               p_n001 => p_op_seq,
+                               p_n002 => p_qty);
+  END;
+
+  PROCEDURE cart_remove (p_seq_id NUMBER) IS
+  BEGIN
+    IF apex_collection.collection_exists(c_cart) THEN
+      apex_collection.delete_member(p_collection_name => c_cart, p_seq => p_seq_id);
+    END IF;
+  END;
+
+  FUNCTION submit_ticket (p_user VARCHAR2, p_comment VARCHAR2) RETURN NUMBER IS
+    v_id   NUMBER;
+    v_line NUMBER := 0;
+    v_open NUMBER;
+    v_loc  VARCHAR2(200);
+    q      mq_material_queue%ROWTYPE;
+  BEGIN
+    IF has_any_role(p_user) = 'N' THEN
+      fail('You need an active Scranton role to submit an inspection ticket.');
+    END IF;
+    IF NOT apex_collection.collection_exists(c_cart)
+       OR apex_collection.collection_member_count(c_cart) = 0 THEN
+      fail('Add at least one job before submitting.');
+    END IF;
+
+    SAVEPOINT sp_submit;   -- if any job fails a check, nothing is saved
+
+    INSERT INTO insp_tickets (site, status, requested_by)
+    VALUES ('Scranton', 'SUBMITTED', UPPER(p_user))
+    RETURNING id INTO v_id;
+
+    FOR m IN (SELECT seq_id, c001 AS job, c002 AS loc, n001 AS op_seq, n002 AS qty
+              FROM   apex_collections
+              WHERE  collection_name = c_cart
+              ORDER  BY seq_id)
+    LOOP
+      v_open := open_line_ticket(m.job, m.op_seq);
+      IF v_open IS NOT NULL THEN
+        fail('Job ' || m.job || ' op ' || m.op_seq || ' is already on open ticket ' || v_open || '.');
+      END IF;
+
+      BEGIN
+        SELECT * INTO q FROM mq_material_queue
+        WHERE  job = m.job AND op_seq = m.op_seq
+        FETCH FIRST 1 ROW ONLY;
+      EXCEPTION WHEN NO_DATA_FOUND THEN
+        fail('Job ' || m.job || ' op ' || m.op_seq || ' is no longer in the Material Queue Report.');
+      END;
+
+      v_line := v_line + 1;
+      v_loc  := location_name(m.loc);
+      INSERT INTO insp_ticket_lines (
+        ticket_id, line_no, job, op_seq, assembly_number, assy_description, dept,
+        op_description, plnr, project, qty, from_location_code, from_location_name)
+      VALUES (
+        v_id, v_line, m.job, m.op_seq, q.assembly_number, q.assy_description, q.dept,
+        q.op_description, q.plnr, q.project, NVL(m.qty, q.in_queue),
+        m.loc, v_loc);
+    END LOOP;
+
+    log_event(v_id, NULL, NULL, 'SUBMIT', NULL, 'SUBMITTED', p_user, v_line || ' job(s)');
+    add_comment(v_id, NULL, NULL, p_comment, p_user);
+    apex_collection.truncate_collection(c_cart);
+    RETURN v_id;
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK TO sp_submit;
+      RAISE;
+  END;
+
+  -- ---------------------------------------------------------------- planner
+  PROCEDURE set_priority (p_ticket_id NUMBER, p_priority NUMBER, p_user VARCHAR2) IS
+    r insp_tickets%ROWTYPE := lock_ticket(p_ticket_id);
+  BEGIN
+    IF p_priority IS NULL OR p_priority NOT BETWEEN 1 AND 10 OR p_priority <> TRUNC(p_priority) THEN
+      fail('Priority must be a whole number from 1 to 10.');
+    END IF;
+
+    IF r.priority IS NULL THEN
+      require_role(p_user, c_mgr, 'set a priority');
+      IF r.status <> 'SUBMITTED' THEN
+        fail('Ticket ' || r.id || ' is ' || r.status || ' and cannot be prioritized.');
+      END IF;
+      UPDATE insp_tickets
+      SET    priority = p_priority, prioritized_by = UPPER(p_user),
+             prioritized_ts = SYSTIMESTAMP, status = 'PRIORITIZED'
+      WHERE  id = r.id;
+      log_event(r.id, NULL, NULL, 'PRIORITIZE', 'SUBMITTED', 'PRIORITIZED', p_user, 'Priority ' || p_priority);
+    ELSE
+      require_role(p_user, 'ADMIN', 'change a locked priority');
+      IF r.status IN ('INSPECTED', 'CLOSED', 'CANCELLED') THEN
+        fail('Ticket ' || r.id || ' is ' || r.status || '; its priority can no longer change.');
+      END IF;
+      BEGIN
+        UPDATE insp_tickets SET priority = p_priority WHERE id = r.id;
+      EXCEPTION WHEN DUP_VAL_ON_INDEX THEN
+        fail(r.assigned_inspector || ' already has an open priority ' || p_priority || ' ticket.');
+      END;
+      log_event(r.id, NULL, NULL, 'PRIORITY_OVERRIDE', r.status, r.status, p_user,
+                'Priority ' || r.priority || ' -> ' || p_priority);
+    END IF;
+  END;
+
+  -- ---------------------------------------------------------------- manager
+  PROCEDURE assign_inspector (p_ticket_id NUMBER, p_inspector VARCHAR2, p_user VARCHAR2) IS
+    r     insp_tickets%ROWTYPE := lock_ticket(p_ticket_id);
+    v_new VARCHAR2(20);
+    v_evt VARCHAR2(30);
+  BEGIN
+    require_role(p_user, c_mgr, 'assign inspectors');
+
+    IF r.status = 'PRIORITIZED' THEN
+      v_new := 'ASSIGNED';  v_evt := 'ASSIGN';
+    ELSIF r.status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD') THEN
+      v_new := r.status;    v_evt := 'REASSIGN';
+    ELSIF r.status = 'SUBMITTED' THEN
+      fail('Ticket ' || r.id || ' needs a priority from a planner before it can be assigned.');
+    ELSE
+      fail('Ticket ' || r.id || ' is ' || r.status || ' and cannot be assigned.');
+    END IF;
+
+    IF p_inspector IS NULL OR has_role(p_inspector, 'INSPECTOR') = 'N' THEN
+      fail(NVL(p_inspector, 'That user') || ' is not an active Scranton inspector.');
+    END IF;
+
+    BEGIN
+      UPDATE insp_tickets
+      SET    assigned_inspector = UPPER(p_inspector), assigned_by = UPPER(p_user),
+             assigned_ts = SYSTIMESTAMP, status = v_new
+      WHERE  id = r.id;
+    EXCEPTION WHEN DUP_VAL_ON_INDEX THEN
+      fail(UPPER(p_inspector) || ' already has an open priority ' || r.priority ||
+           ' ticket. Choose another inspector.');
+    END;
+
+    log_event(r.id, NULL, NULL, v_evt, r.status, v_new, p_user,
+              NVL(r.assigned_inspector, '-') || ' -> ' || UPPER(p_inspector));
+  END;
+
+  PROCEDURE cancel_ticket (p_ticket_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2) IS
+    r insp_tickets%ROWTYPE := lock_ticket(p_ticket_id);
+  BEGIN
+    require_role(p_user, c_mgr, 'cancel tickets');
+    IF TRIM(p_reason) IS NULL THEN fail('Enter a reason for cancelling.'); END IF;
+    IF r.status IN ('CLOSED', 'CANCELLED') THEN
+      fail('Ticket ' || r.id || ' is already ' || r.status || '.');
+    END IF;
+    UPDATE insp_tickets
+    SET    status = 'CANCELLED', cancelled_by = UPPER(p_user),
+           cancelled_ts = SYSTIMESTAMP, cancel_reason = TRIM(p_reason)
+    WHERE  id = r.id;
+    log_event(r.id, NULL, NULL, 'CANCEL', r.status, 'CANCELLED', p_user, p_reason);
+    add_comment(r.id, NULL, NULL, 'Cancelled: ' || p_reason, p_user);
+  END;
+
+  -- ---------------------------------------------------------------- inspector
+  PROCEDURE start_inspection (p_ticket_id NUMBER, p_user VARCHAR2) IS
+    r insp_tickets%ROWTYPE := lock_ticket(p_ticket_id);
+  BEGIN
+    require_assignee(r, p_user);
+    IF r.status <> 'ASSIGNED' THEN
+      fail('Ticket ' || r.id || ' is ' || r.status || ' and cannot be started.');
+    END IF;
+    UPDATE insp_tickets
+    SET    status = 'IN_PROGRESS', started_ts = NVL(started_ts, SYSTIMESTAMP)
+    WHERE  id = r.id;
+    log_event(r.id, NULL, NULL, 'START', 'ASSIGNED', 'IN_PROGRESS', p_user);
+  END;
+
+  PROCEDURE hold_inspection (p_ticket_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2) IS
+    r insp_tickets%ROWTYPE := lock_ticket(p_ticket_id);
+  BEGIN
+    require_assignee(r, p_user);
+    IF r.status <> 'IN_PROGRESS' THEN
+      fail('Only a ticket in progress can be put on hold.');
+    END IF;
+    UPDATE insp_tickets SET status = 'ON_HOLD' WHERE id = r.id;
+    log_event(r.id, NULL, NULL, 'HOLD', 'IN_PROGRESS', 'ON_HOLD', p_user, p_reason);
+    add_comment(r.id, NULL, NULL, CASE WHEN TRIM(p_reason) IS NOT NULL THEN 'On hold: ' || p_reason END, p_user);
+  END;
+
+  PROCEDURE resume_inspection (p_ticket_id NUMBER, p_user VARCHAR2) IS
+    r       insp_tickets%ROWTYPE := lock_ticket(p_ticket_id);
+    v_since TIMESTAMP;
+  BEGIN
+    require_assignee(r, p_user);
+    IF r.status <> 'ON_HOLD' THEN
+      fail('Ticket ' || r.id || ' is not on hold.');
+    END IF;
+    SELECT MAX(event_ts) INTO v_since
+    FROM   insp_events
+    WHERE  ticket_id = r.id AND event_code = 'HOLD';
+
+    UPDATE insp_tickets
+    SET    status = 'IN_PROGRESS',
+           hold_seconds = NVL(hold_seconds, 0)
+                          + NVL(ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_since AS DATE)) * 86400), 0)
+    WHERE  id = r.id;
+    log_event(r.id, NULL, NULL, 'RESUME', 'ON_HOLD', 'IN_PROGRESS', p_user);
+  END;
+
+  PROCEDURE result_line (p_line_id NUMBER, p_result VARCHAR2, p_user VARCHAR2,
+                         p_note VARCHAR2 DEFAULT NULL, p_to_location VARCHAR2 DEFAULT NULL) IS
+    l     insp_ticket_lines%ROWTYPE;
+    r     insp_tickets%ROWTYPE;
+    v_new VARCHAR2(20);
+    v_fl  NUMBER;
+  BEGIN
+    SAVEPOINT sp_result;   -- result + forklift ticket are saved together or not at all
+    BEGIN
+      SELECT * INTO l FROM insp_ticket_lines WHERE id = p_line_id FOR UPDATE;
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+      fail('Job line ' || p_line_id || ' was not found.');
+    END;
+
+    r := lock_ticket(l.ticket_id);
+    require_assignee(r, p_user);
+
+    IF r.status <> 'IN_PROGRESS' THEN
+      fail('Start (or resume) the inspection before recording results.');
+    END IF;
+    IF l.line_status <> 'OPEN' THEN
+      fail('Job ' || l.job || ' already has a result (' || l.line_status || ').');
+    END IF;
+
+    IF UPPER(p_result) = 'PASS' THEN
+      v_new := CASE WHEN p_to_location IS NOT NULL THEN 'PASSED_FORKLIFT' ELSE 'PASSED' END;
+    ELSIF UPPER(p_result) = 'FAIL' THEN
+      IF TRIM(p_note) IS NULL THEN fail('Enter the reason job ' || l.job || ' failed.'); END IF;
+      v_new := 'FAILED';
+    ELSE
+      fail('Result must be PASS or FAIL.');
+    END IF;
+
+    IF v_new = 'PASSED_FORKLIFT' AND l.from_location_code IS NULL THEN
+      fail('Job ' || l.job || ' has no pickup location. Use Pass (close only), then call a forklift from the Forklift page.');
+    END IF;
+
+    UPDATE insp_ticket_lines
+    SET    line_status = v_new, result_by = UPPER(p_user), result_ts = SYSTIMESTAMP
+    WHERE  id = l.id;
+
+    log_event(r.id, l.id, NULL, UPPER(p_result), 'OPEN', v_new, p_user, p_note);
+    add_comment(r.id, NULL, l.id, p_note, p_user);
+
+    IF v_new = 'PASSED_FORKLIFT' THEN
+      v_fl := create_forklift(l.from_location_code, p_to_location, p_user,
+                              l.job, l.op_seq, NULL, 'INSPECTION', l.id);
+      log_event(r.id, l.id, v_fl, 'SEND_FORKLIFT', NULL, 'OPEN', p_user);
+    END IF;
+
+    check_completion(r.id, p_user);
+  EXCEPTION
+    WHEN OTHERS THEN
+      ROLLBACK TO sp_result;
+      RAISE;
+  END;
+
+  PROCEDURE close_failed_line (p_line_id NUMBER, p_user VARCHAR2, p_note VARCHAR2) IS
+    l insp_ticket_lines%ROWTYPE;
+  BEGIN
+    require_role(p_user, c_mgr, 'close failed jobs');
+    IF TRIM(p_note) IS NULL THEN fail('Enter a closing note for the failed job.'); END IF;
+    BEGIN
+      SELECT * INTO l FROM insp_ticket_lines WHERE id = p_line_id FOR UPDATE;
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+      fail('Job line ' || p_line_id || ' was not found.');
+    END;
+    IF l.line_status <> 'FAILED' THEN
+      fail('Job ' || l.job || ' is ' || l.line_status || ', not FAILED.');
+    END IF;
+    UPDATE insp_ticket_lines
+    SET    line_status = 'FAILED_CLOSED', failed_closed_by = UPPER(p_user),
+           failed_closed_ts = SYSTIMESTAMP
+    WHERE  id = l.id;
+    log_event(l.ticket_id, l.id, NULL, 'CLOSE_FAILED', 'FAILED', 'FAILED_CLOSED', p_user, p_note);
+    add_comment(l.ticket_id, NULL, l.id, p_note, p_user);
+    check_completion(l.ticket_id, p_user);
+  END;
+
+  -- ---------------------------------------------------------------- forklift
+  FUNCTION create_forklift (p_from_location VARCHAR2, p_to_location VARCHAR2, p_user VARCHAR2,
+                            p_job VARCHAR2 DEFAULT NULL, p_op_seq NUMBER DEFAULT NULL,
+                            p_comment VARCHAR2 DEFAULT NULL, p_source VARCHAR2 DEFAULT 'FLOOR',
+                            p_line_id NUMBER DEFAULT NULL) RETURN NUMBER IS
+    v_id   NUMBER;
+    v_from VARCHAR2(200);
+    v_to   VARCHAR2(200);
+  BEGIN
+    IF has_any_role(p_user) = 'N' THEN
+      fail('You need an active Scranton role to request a forklift.');
+    END IF;
+    IF p_from_location IS NULL OR p_to_location IS NULL THEN
+      fail('Select both a pickup and a drop-off location.');
+    END IF;
+    IF p_from_location = p_to_location THEN
+      fail('Pickup and drop-off locations must be different.');
+    END IF;
+    v_from := location_name(p_from_location);
+    v_to   := location_name(p_to_location);
+
+    INSERT INTO fl_tickets (site, source, ticket_line_id, job, op_seq,
+                            from_location_code, from_location_name,
+                            to_location_code, to_location_name, status, requested_by)
+    VALUES ('Scranton', UPPER(p_source), p_line_id, TRIM(p_job), p_op_seq,
+            p_from_location, v_from,
+            p_to_location, v_to, 'OPEN', UPPER(p_user))
+    RETURNING id INTO v_id;
+
+    log_event(NULL, p_line_id, v_id, 'FL_REQUEST', NULL, 'OPEN', p_user);
+    add_comment(NULL, v_id, NULL, p_comment, p_user);
+    RETURN v_id;
+  END;
+
+  PROCEDURE claim_forklift (p_fl_id NUMBER, p_user VARCHAR2) IS
+  BEGIN
+    IF is_driver(p_user) = 'N' THEN
+      fail('You need a current Forklift qualification at Scranton to claim forklift tickets.');
+    END IF;
+    UPDATE fl_tickets
+    SET    status = 'CLAIMED', driver = UPPER(p_user), claimed_ts = SYSTIMESTAMP
+    WHERE  id = p_fl_id AND status = 'OPEN';
+    IF SQL%ROWCOUNT = 0 THEN
+      fail('Forklift ticket ' || p_fl_id || ' was already claimed by another driver.');
+    END IF;
+    log_event(NULL, NULL, p_fl_id, 'FL_CLAIM', 'OPEN', 'CLAIMED', p_user);
+  END;
+
+  PROCEDURE pickup_forklift (p_fl_id NUMBER, p_user VARCHAR2) IS
+    r fl_tickets%ROWTYPE := lock_fl(p_fl_id);
+  BEGIN
+    IF UPPER(NVL(r.driver, '-')) <> UPPER(p_user) THEN
+      fail('Forklift ticket ' || r.id || ' is not claimed by you.');
+    END IF;
+    IF r.status <> 'CLAIMED' THEN
+      fail('Forklift ticket ' || r.id || ' is ' || r.status || '.');
+    END IF;
+    UPDATE fl_tickets SET status = 'PICKED_UP', picked_up_ts = SYSTIMESTAMP WHERE id = r.id;
+    log_event(NULL, r.ticket_line_id, r.id, 'FL_PICKUP', 'CLAIMED', 'PICKED_UP', p_user);
+  END;
+
+  PROCEDURE deliver_forklift (p_fl_id NUMBER, p_user VARCHAR2) IS
+    r fl_tickets%ROWTYPE := lock_fl(p_fl_id);
+  BEGIN
+    IF UPPER(NVL(r.driver, '-')) <> UPPER(p_user) THEN
+      fail('Forklift ticket ' || r.id || ' is not claimed by you.');
+    END IF;
+    IF r.status <> 'PICKED_UP' THEN
+      fail('Mark forklift ticket ' || r.id || ' as Picked Up first.');
+    END IF;
+    UPDATE fl_tickets SET status = 'DELIVERED', delivered_ts = SYSTIMESTAMP WHERE id = r.id;
+    log_event(NULL, r.ticket_line_id, r.id, 'FL_DELIVER', 'PICKED_UP', 'DELIVERED', p_user);
+  END;
+
+  PROCEDURE release_forklift (p_fl_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2) IS
+    r fl_tickets%ROWTYPE := lock_fl(p_fl_id);
+  BEGIN
+    require_role(p_user, c_mgr, 'release forklift tickets');
+    IF TRIM(p_reason) IS NULL THEN fail('Enter a reason for releasing the ticket.'); END IF;
+    IF r.status NOT IN ('CLAIMED', 'PICKED_UP') THEN
+      fail('Only a claimed forklift ticket can be released.');
+    END IF;
+    UPDATE fl_tickets
+    SET    status = 'OPEN', driver = NULL, claimed_ts = NULL, picked_up_ts = NULL
+    WHERE  id = r.id;
+    log_event(NULL, r.ticket_line_id, r.id, 'FL_RELEASE', r.status, 'OPEN', p_user,
+              'Released from ' || r.driver || ': ' || p_reason);
+    add_comment(NULL, r.id, NULL, 'Released from ' || r.driver || ': ' || p_reason, p_user);
+  END;
+
+  PROCEDURE cancel_forklift (p_fl_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2) IS
+    r fl_tickets%ROWTYPE := lock_fl(p_fl_id);
+  BEGIN
+    IF has_role(p_user, c_mgr) = 'N'
+       AND NOT (UPPER(r.requested_by) = UPPER(p_user) AND r.status = 'OPEN') THEN
+      fail('Only a manager, or the requester while the ticket is still open, can cancel it.');
+    END IF;
+    IF TRIM(p_reason) IS NULL THEN fail('Enter a reason for cancelling.'); END IF;
+    IF r.status IN ('DELIVERED', 'CANCELLED') THEN
+      fail('Forklift ticket ' || r.id || ' is already ' || r.status || '.');
+    END IF;
+    UPDATE fl_tickets
+    SET    status = 'CANCELLED', cancelled_by = UPPER(p_user),
+           cancelled_ts = SYSTIMESTAMP, cancel_reason = TRIM(p_reason)
+    WHERE  id = r.id;
+    log_event(NULL, r.ticket_line_id, r.id, 'FL_CANCEL', r.status, 'CANCELLED', p_user, p_reason);
+    add_comment(NULL, r.id, NULL, 'Cancelled: ' || p_reason, p_user);
+  END;
+
+END insp_api;
+/
+
+-- Check: both should be VALID, and the errors query should return no rows
+SELECT object_name, object_type, status
+FROM   user_objects
+WHERE  object_name = 'INSP_API'
+ORDER  BY object_type;
+
+SELECT name, type, line, position, text
+FROM   user_errors
+WHERE  name = 'INSP_API'
+ORDER  BY type, sequence;
+
+-- END OF FILE insp_api_package.sql (658 lines, no backticks anywhere)

@@ -1,104 +1,168 @@
-Step 2: Region "Assign Inspectors" (Interactive Grid)
+A2. Pre-Rendering → Before Header → Process "Load Ticket"
 
-SELECT t.id,
-       t.id                 AS ticket_no,
+DECLARE
+  r insp_tickets%ROWTYPE;
+BEGIN
+  SELECT * INTO r FROM insp_tickets WHERE id = :P34_TICKET_ID;
+
+  IF NOT (UPPER(r.requested_by) = UPPER(:APP_USER)
+          OR UPPER(NVL(r.assigned_inspector, '-')) = UPPER(:APP_USER)
+          OR insp_api.is_manager(:APP_USER) = 'Y') THEN
+    RAISE_APPLICATION_ERROR(-20100, 'You do not have access to ticket ' || r.id || '.');
+  END IF;
+
+  :P34_STATUS  := r.status;
+  :P34_CAN_ACT := CASE WHEN UPPER(NVL(r.assigned_inspector, '-')) = UPPER(:APP_USER)
+                         OR insp_api.is_manager(:APP_USER) = 'Y'
+                       THEN 'Y' ELSE 'N' END;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RAISE_APPLICATION_ERROR(-20100, 'Ticket ' || :P34_TICKET_ID || ' was not found.');
+END;
+
+A3. Region "Ticket" source (Classic Report)
+
+SELECT t.id                 AS ticket_no,
        t.status,
        t.priority,
        t.assigned_inspector AS inspector,
        t.requested_by       AS submitted_by,
-       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
-       (SELECT LISTAGG(l.job || ' / ' || l.op_seq, ', ') WITHIN GROUP (ORDER BY l.line_no)
-        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS job_list,
-       (SELECT MIN(q.due_date)
-        FROM   insp_ticket_lines l
-        JOIN   mq_material_queue q ON q.job = l.job AND q.op_seq = l.op_seq
-        WHERE  l.ticket_id = t.id) AS earliest_due,
-       t.prioritized_ts     AS prioritized,
-       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(NVL(t.assigned_ts, t.prioritized_ts) AS DATE)) * 24, 1) AS hours_in_status
+       t.requested_ts       AS submitted,
+       t.started_ts         AS started,
+       t.inspected_ts       AS inspected,
+       t.closed_ts          AS closed,
+       ROUND(((CAST(NVL(t.inspected_ts, SYSTIMESTAMP) AS DATE) - CAST(t.started_ts AS DATE)) * 86400
+              - NVL(t.hold_seconds, 0)) / 60) AS inspect_minutes
 FROM   insp_tickets t
-WHERE  t.status IN ('PRIORITIZED', 'ASSIGNED', 'IN_PROGRESS', 'ON_HOLD')
+WHERE  t.id = :P34_TICKET_ID
 
 
-INSPECTOR LOV (SQL Query).
+A4. Region 2: "Jobs" (Interactive Grid)
 
-SELECT NVL((SELECT MIN(x.last_name || ', ' || x.first_name)
-            FROM   idm_personnel_v x
-            WHERE  UPPER(x.shortname) = UPPER(r.unixid)), r.unixid)
-       || '  (' ||
-       (SELECT COUNT(*) FROM insp_tickets t
-        WHERE  UPPER(t.assigned_inspector) = UPPER(r.unixid)
-        AND    t.status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD')) || ' open)' AS d,
-       UPPER(r.unixid) AS r
-FROM   app_user_roles r
-WHERE  r.role_code = 'INSPECTOR'
-AND    r.is_active = 'Y'
-AND    UPPER(r.site) = 'SCRANTON'
-ORDER  BY 1
-
-
-Processing: click Assign Inspectors
-
-
-BEGIN
-  IF :APEX$ROW_STATUS = 'U' THEN
-    insp_api.assign_inspector(:ID, :INSPECTOR, :APP_USER);
-  END IF;
-END;
-
-Region "Who Is Working on What"
-
-SELECT (SELECT MIN(x.last_name || ', ' || x.first_name)
-        FROM   idm_personnel_v x
-        WHERE  UPPER(x.shortname) = UPPER(r.unixid)) AS inspector,
-       COUNT(CASE WHEN t.status = 'ASSIGNED'    THEN 1 END) AS assigned,
-       COUNT(CASE WHEN t.status = 'IN_PROGRESS' THEN 1 END) AS in_progress,
-       COUNT(CASE WHEN t.status = 'ON_HOLD'     THEN 1 END) AS on_hold,
-       LISTAGG(CASE WHEN t.id IS NOT NULL THEN '#' || t.id || ' (P' || t.priority || ')' END, ', ')
-         WITHIN GROUP (ORDER BY t.priority) AS open_tickets
-FROM   app_user_roles r
-LEFT JOIN insp_tickets t
-       ON  UPPER(t.assigned_inspector) = UPPER(r.unixid)
-       AND t.status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD')
-WHERE  r.role_code = 'INSPECTOR'
-AND    r.is_active = 'Y'
-AND    UPPER(r.site) = 'SCRANTON'
-GROUP  BY r.unixid
-ORDER  BY 1
-
-Region "Failed Jobs"
-
-
-SELECT l.id               AS line_id,
-       l.ticket_id        AS ticket_no,
+SELECT l.id                 AS line_id,
+       l.line_no,
        l.job,
        l.op_seq,
        l.assy_description,
        l.op_description,
-       l.result_by        AS failed_by,
-       l.result_ts        AS failed_on,
-       (SELECT MAX(c.comment_text) KEEP (DENSE_RANK LAST ORDER BY c.comment_ts)
-        FROM   insp_comments c WHERE c.ticket_line_id = l.id) AS fail_reason,
-       CAST(NULL AS VARCHAR2(4000)) AS close_note
+       l.dept,
+       l.qty,
+       l.from_location_name AS location,
+       l.line_status,
+       (SELECT MAX(f.status || ' - ' || NVL(f.driver, 'unclaimed'))
+        FROM   fl_tickets f WHERE f.ticket_line_id = l.id) AS forklift,
+       CAST(NULL AS VARCHAR2(10))   AS result,
+       CAST(NULL AS VARCHAR2(30))   AS to_location,
+       CAST(NULL AS VARCHAR2(4000)) AS note
 FROM   insp_ticket_lines l
-WHERE  l.line_status = 'FAILED'
+WHERE  l.ticket_id = :P34_TICKET_ID
+
+RESULT: Select List, Heading Result. LOV SQL:
+
+SELECT 'Close' AS d, 'PASS' AS r FROM dual
+UNION ALL SELECT 'Close + Send to Forklift', 'PASS_FL' FROM dual
+UNION ALL SELECT 'Fail', 'FAIL' FROM dual
 
 
-Processing: set Failed Jobs – Save Interactive Grid Data
+TO_LOCATION: Select List, Heading Forklift To. LOV SQL:
+
+SELECT location_name || '   (' || location_type || ')' AS d, location_code AS r
+FROM   fl_locations_v
+ORDER  BY location_type DESC, location_name
+
+
+For all three of RESULT, TO_LOCATION and NOTE, set Read Only → Type PL/SQL Expression, Execute For Each Row:
+
+
+:LINE_STATUS <> 'OPEN' OR :P34_STATUS <> 'IN_PROGRESS' OR :P34_CAN_ACT = 'N'
+
+
+Processing: set Jobs – Save Interactive Grid Data → Target Type PL/SQL Code:
 
 BEGIN
-  IF :APEX$ROW_STATUS = 'U' AND TRIM(:CLOSE_NOTE) IS NOT NULL THEN
-    insp_api.close_failed_line(:LINE_ID, :APP_USER, :CLOSE_NOTE);
+  IF :APEX$ROW_STATUS = 'U' AND :RESULT IS NOT NULL THEN
+    IF :RESULT = 'PASS_FL' AND :TO_LOCATION IS NULL THEN
+      RAISE_APPLICATION_ERROR(-20100, 'Pick a Forklift To location for job ' || :JOB || '.');
+    END IF;
+    insp_api.result_line(:LINE_ID,
+                         CASE WHEN :RESULT = 'FAIL' THEN 'FAIL' ELSE 'PASS' END,
+                         :APP_USER,
+                         :NOTE,
+                         CASE WHEN :RESULT = 'PASS_FL' THEN :TO_LOCATION END);
   END IF;
 END;
 
 
 
+A5. Region 3: "Comments" (Classic Report)
 
 
 
+SELECT c.comment_ts    AS posted,
+       c.comment_by    AS by_user,
+       c.comment_role  AS role,
+       c.ticket_status AS at_status,
+       (SELECT l.job || ' / ' || l.op_seq FROM insp_ticket_lines l WHERE l.id = c.ticket_line_id) AS job,
+       c.comment_text  AS comment_text
+FROM   insp_comments c
+WHERE  c.ticket_id = :P34_TICKET_ID
+ORDER  BY c.comment_ts DESC
 
 
+A6. Region 4: "Timeline" (Classic Report)
 
+SELECT e.event_ts    AS at_time,
+       e.event_code  AS event,
+       e.from_status,
+       e.to_status,
+       e.event_by    AS by_user,
+       e.note
+FROM   insp_events e
+WHERE  e.ticket_id = :P34_TICKET_ID
+ORDER  BY e.id
+
+
+Process "Ticket Action" (seq 10)
+
+	•	Server-side Condition: Request is contained in Value, START,HOLD,RESUME,ADD_COMMENT
+
+BEGIN
+  CASE :REQUEST
+    WHEN 'START'  THEN insp_api.start_inspection(:P34_TICKET_ID, :APP_USER);
+    WHEN 'HOLD'   THEN
+      IF TRIM(:P34_NEW_COMMENT) IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20100, 'Type the hold reason in the comment box first.');
+      END IF;
+      insp_api.hold_inspection(:P34_TICKET_ID, :APP_USER, :P34_NEW_COMMENT);
+    WHEN 'RESUME' THEN insp_api.resume_inspection(:P34_TICKET_ID, :APP_USER);
+    WHEN 'ADD_COMMENT' THEN
+      insp_api.add_comment(:P34_TICKET_ID, NULL, NULL, :P34_NEW_COMMENT, :APP_USER);
+  END CASE;
+  :P34_NEW_COMMENT := NULL;
+END;
+
+Region "My Open Inspections" (Interactive Report):
+
+SELECT t.id AS ticket_no,
+       t.priority,
+       t.status,
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id AND l.line_status = 'OPEN') AS jobs_open,
+       (SELECT LISTAGG(l.job || ' / ' || l.op_seq, ', ') WITHIN GROUP (ORDER BY l.line_no)
+        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS job_list,
+       (SELECT MIN(l.from_location_name) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS location,
+       t.assigned_ts AS assigned,
+       t.started_ts  AS started
+FROM   insp_tickets t
+WHERE  UPPER(t.assigned_inspector) = UPPER(:APP_USER)
+AND    t.status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD')
+ORDER  BY t.priority, t.assigned_ts
+
+
+	5.	Check that a forklift ticket was created:
+
+SELECT id, source, job, op_seq, from_location_name, to_location_name, status, requested_by
+FROM   fl_tickets ORDER BY id
 
 
 

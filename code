@@ -1,9 +1,11 @@
+Step 2: Region "Assign Inspectors" (Interactive Grid)
+
 SELECT t.id,
-       t.id            AS ticket_no,
+       t.id                 AS ticket_no,
        t.status,
        t.priority,
-       t.requested_ts  AS submitted,
-       t.requested_by  AS submitted_by,
+       t.assigned_inspector AS inspector,
+       t.requested_by       AS submitted_by,
        (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
        (SELECT LISTAGG(l.job || ' / ' || l.op_seq, ', ') WITHIN GROUP (ORDER BY l.line_no)
         FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS job_list,
@@ -11,7 +13,113 @@ SELECT t.id,
         FROM   insp_ticket_lines l
         JOIN   mq_material_queue q ON q.job = l.job AND q.op_seq = l.op_seq
         WHERE  l.ticket_id = t.id) AS earliest_due,
-       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(t.requested_ts AS DATE)) * 24, 1) AS hours_waiting
+       t.prioritized_ts     AS prioritized,
+       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(NVL(t.assigned_ts, t.prioritized_ts) AS DATE)) * 24, 1) AS hours_in_status
 FROM   insp_tickets t
-WHERE  t.status IN ('SUBMITTED', 'PRIORITIZED')
-ORDER  BY CASE t.status WHEN 'SUBMITTED' THEN 0 ELSE 1 END, t.requested_ts
+WHERE  t.status IN ('PRIORITIZED', 'ASSIGNED', 'IN_PROGRESS', 'ON_HOLD')
+
+
+INSPECTOR LOV (SQL Query).
+
+SELECT NVL((SELECT MIN(x.last_name || ', ' || x.first_name)
+            FROM   idm_personnel_v x
+            WHERE  UPPER(x.shortname) = UPPER(r.unixid)), r.unixid)
+       || '  (' ||
+       (SELECT COUNT(*) FROM insp_tickets t
+        WHERE  UPPER(t.assigned_inspector) = UPPER(r.unixid)
+        AND    t.status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD')) || ' open)' AS d,
+       UPPER(r.unixid) AS r
+FROM   app_user_roles r
+WHERE  r.role_code = 'INSPECTOR'
+AND    r.is_active = 'Y'
+AND    UPPER(r.site) = 'SCRANTON'
+ORDER  BY 1
+
+
+Processing: click Assign Inspectors
+
+
+BEGIN
+  IF :APEX$ROW_STATUS = 'U' THEN
+    insp_api.assign_inspector(:ID, :INSPECTOR, :APP_USER);
+  END IF;
+END;
+
+Region "Who Is Working on What"
+
+SELECT (SELECT MIN(x.last_name || ', ' || x.first_name)
+        FROM   idm_personnel_v x
+        WHERE  UPPER(x.shortname) = UPPER(r.unixid)) AS inspector,
+       COUNT(CASE WHEN t.status = 'ASSIGNED'    THEN 1 END) AS assigned,
+       COUNT(CASE WHEN t.status = 'IN_PROGRESS' THEN 1 END) AS in_progress,
+       COUNT(CASE WHEN t.status = 'ON_HOLD'     THEN 1 END) AS on_hold,
+       LISTAGG(CASE WHEN t.id IS NOT NULL THEN '#' || t.id || ' (P' || t.priority || ')' END, ', ')
+         WITHIN GROUP (ORDER BY t.priority) AS open_tickets
+FROM   app_user_roles r
+LEFT JOIN insp_tickets t
+       ON  UPPER(t.assigned_inspector) = UPPER(r.unixid)
+       AND t.status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD')
+WHERE  r.role_code = 'INSPECTOR'
+AND    r.is_active = 'Y'
+AND    UPPER(r.site) = 'SCRANTON'
+GROUP  BY r.unixid
+ORDER  BY 1
+
+Region "Failed Jobs"
+
+
+SELECT l.id               AS line_id,
+       l.ticket_id        AS ticket_no,
+       l.job,
+       l.op_seq,
+       l.assy_description,
+       l.op_description,
+       l.result_by        AS failed_by,
+       l.result_ts        AS failed_on,
+       (SELECT MAX(c.comment_text) KEEP (DENSE_RANK LAST ORDER BY c.comment_ts)
+        FROM   insp_comments c WHERE c.ticket_line_id = l.id) AS fail_reason,
+       CAST(NULL AS VARCHAR2(4000)) AS close_note
+FROM   insp_ticket_lines l
+WHERE  l.line_status = 'FAILED'
+
+
+Processing: set Failed Jobs – Save Interactive Grid Data
+
+BEGIN
+  IF :APEX$ROW_STATUS = 'U' AND TRIM(:CLOSE_NOTE) IS NOT NULL THEN
+    insp_api.close_failed_line(:LINE_ID, :APP_USER, :CLOSE_NOTE);
+  END IF;
+END;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

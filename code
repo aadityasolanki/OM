@@ -1,122 +1,18 @@
-SELECT location_name || '   (' || location_type || ')' AS d, location_code AS r
-FROM   fl_locations_v
-ORDER  BY location_type DESC, location_name
+DELETE FROM veh_qualifications
+WHERE  level_id IN (SELECT l.id
+                    FROM   veh_equipment_levels l
+                    JOIN   veh_equipment_categories c ON c.id = l.category_id
+                    WHERE  UPPER(c.site) = 'SCRANTON'
+                    AND    UPPER(c.category_name) IN ('TEST', 'APPLE'))
 
-:P34_STATUS = 'IN_PROGRESS' AND :P34_CAN_ACT = 'Y'
 
-Step 3: New region "Jobs" (Classic Report)
-
-SELECT l.line_no,
-       l.job,
-       l.op_seq,
-       l.assy_description,
-       l.op_description,
-       l.dept,
-       l.qty,
-       l.from_location_name AS location,
-       CASE l.line_status
-         WHEN 'OPEN'            THEN 'Open'
-         WHEN 'PASSED'          THEN 'Completed'
-         WHEN 'PASSED_FORKLIFT' THEN 'Completed - sent to forklift'
-         WHEN 'FAILED'          THEN 'Failed - rework (with manager)'
-         WHEN 'FAILED_CLOSED'   THEN 'Failed - closed'
-       END AS result,
-       (SELECT MAX(f.status || ' - ' || NVL(f.driver, 'unclaimed') || ' -> ' || f.to_location_name)
-        FROM   fl_tickets f WHERE f.ticket_line_id = l.id) AS forklift,
-       CASE WHEN l.line_status = 'OPEN' AND :P34_STATUS = 'IN_PROGRESS' AND :P34_CAN_ACT = 'Y' THEN
-         '<button type="button" class="t-Button t-Button--small t-Button--success line-act" data-line="' || l.id || '" data-act="PASS">Complete</button> ' ||
-         '<button type="button" class="t-Button t-Button--small t-Button--primary line-act" data-line="' || l.id || '" data-act="PASS_FL">Complete + Forklift</button> ' ||
-         '<button type="button" class="t-Button t-Button--small t-Button--danger line-act" data-line="' || l.id || '" data-act="FAIL">Fail / Rework</button>'
-       END AS actions
-FROM   insp_ticket_lines l
-WHERE  l.ticket_id = :P34_TICKET_ID
-ORDER  BY l.line_no
+DELETE FROM veh_equipment_levels
+WHERE  category_id IN (SELECT id FROM veh_equipment_categories
+                       WHERE  UPPER(site) = 'SCRANTON'
+                       AND    UPPER(category_name) IN ('TEST', 'APPLE'))
 
 
 
-
-	•	True action: Execute JavaScript Code
-
-
-var b   = this.triggeringElement;
-var act = b.dataset.act;
-
-if (act === 'FAIL' && !apex.item('P34_NEW_COMMENT').getValue().trim()) {
-  apex.message.alert('Type what needs rework in the comment box, then click Fail / Rework again.');
-  return;
-}
-if (act === 'PASS_FL' && apex.item('P34_TO_LOCATION').isEmpty()) {
-  apex.message.alert('Pick the Forklift To location first.');
-  return;
-}
-apex.page.submit({ request: 'LINE_' + act, set: { 'P34_LINE_ID': b.dataset.line }, showWait: true });
-
-
-Step 5: Replace the "Ticket Action" process
-
-START,HOLD,RESUME,ADD_COMMENT,LINE_PASS,LINE_PASS_FL,LINE_FAIL,ALL_PASS,ALL_PASS_FL
-
-
-DECLARE
-  PROCEDURE pass_all (p_to VARCHAR2) IS
-  BEGIN
-    FOR l IN (SELECT id FROM insp_ticket_lines
-              WHERE  ticket_id = :P34_TICKET_ID AND line_status = 'OPEN'
-              ORDER  BY line_no)
-    LOOP
-      insp_api.result_line(l.id, 'PASS', :APP_USER, NULL, p_to);
-    END LOOP;
-    insp_api.add_comment(:P34_TICKET_ID, NULL, NULL, :P34_NEW_COMMENT, :APP_USER);
-  END;
-BEGIN
-  CASE :REQUEST
-    WHEN 'START'  THEN insp_api.start_inspection(:P34_TICKET_ID, :APP_USER);
-    WHEN 'HOLD'   THEN
-      IF TRIM(:P34_NEW_COMMENT) IS NULL THEN
-        RAISE_APPLICATION_ERROR(-20100, 'Type the hold reason in the comment box first.');
-      END IF;
-      insp_api.hold_inspection(:P34_TICKET_ID, :APP_USER, :P34_NEW_COMMENT);
-    WHEN 'RESUME' THEN insp_api.resume_inspection(:P34_TICKET_ID, :APP_USER);
-    WHEN 'ADD_COMMENT' THEN
-      insp_api.add_comment(:P34_TICKET_ID, NULL, NULL, :P34_NEW_COMMENT, :APP_USER);
-    WHEN 'LINE_PASS' THEN
-      insp_api.result_line(:P34_LINE_ID, 'PASS', :APP_USER, :P34_NEW_COMMENT);
-    WHEN 'LINE_PASS_FL' THEN
-      IF :P34_TO_LOCATION IS NULL THEN
-        RAISE_APPLICATION_ERROR(-20100, 'Pick the Forklift To location first.');
-      END IF;
-      insp_api.result_line(:P34_LINE_ID, 'PASS', :APP_USER, :P34_NEW_COMMENT, :P34_TO_LOCATION);
-    WHEN 'LINE_FAIL' THEN
-      IF TRIM(:P34_NEW_COMMENT) IS NULL THEN
-        RAISE_APPLICATION_ERROR(-20100, 'Type what needs rework in the comment box first.');
-      END IF;
-      insp_api.result_line(:P34_LINE_ID, 'FAIL', :APP_USER, 'Rework needed: ' || :P34_NEW_COMMENT);
-    WHEN 'ALL_PASS' THEN
-      pass_all(NULL);
-    WHEN 'ALL_PASS_FL' THEN
-      IF :P34_TO_LOCATION IS NULL THEN
-        RAISE_APPLICATION_ERROR(-20100, 'Pick the Forklift To location first.');
-      END IF;
-      pass_all(:P34_TO_LOCATION);
-    ELSE
-      RAISE_APPLICATION_ERROR(-20100, 'Unknown button: ' || :REQUEST);
-  END CASE;
-  :P34_NEW_COMMENT := NULL;
-END;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+DELETE FROM veh_equipment_categories
+WHERE  UPPER(site) = 'SCRANTON'
+AND    UPPER(category_name) IN ('TEST', 'APPLE')

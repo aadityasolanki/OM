@@ -1,70 +1,79 @@
-DECLARE
-  c_card CONSTANT VARCHAR2(400) :=
-    'cursor:pointer; width:180px; background:#ffffff; border-radius:10px; ' ||
-    'box-shadow:0 2px 8px rgba(0,0,0,0.1); padding:24px 16px; text-align:center; border-top:4px solid ';
-  v  CLOB;
-  n  NUMBER;
-  f  NUMBER;
+Static ID lb_today. Set Attributes → Template to Badge List, which shows each number as a large tile.
 
-  FUNCTION hdr (p_title VARCHAR2, p_color VARCHAR2) RETURN VARCHAR2 IS
-  BEGIN
-    RETURN '<div style="width:100%; margin-top:24px; margin-bottom:16px;">'
-        || '<div style="font-size:13px; font-weight:700; color:#333; text-transform:uppercase; letter-spacing:1px;">'
-        || p_title || '</div>'
-        || '<div style="height:3px; width:60px; background:' || p_color
-        || '; margin-top:6px; border-radius:2px;"></div></div>';
-  END;
+SELECT (SELECT COUNT(*) FROM insp_tickets WHERE requested_ts >= TRUNC(SYSDATE)) AS submitted,
+       (SELECT COUNT(*) FROM insp_tickets WHERE closed_ts    >= TRUNC(SYSDATE)) AS closed,
+       (SELECT COUNT(*) FROM insp_tickets WHERE status NOT IN ('CLOSED', 'CANCELLED')) AS open_tickets,
+       (SELECT COUNT(*) FROM insp_ticket_lines
+        WHERE  result_ts >= TRUNC(SYSDATE) AND line_status IN ('FAILED', 'FAILED_CLOSED')) AS jobs_failed,
+       (SELECT ROUND(AVG((CAST(inspected_ts AS DATE) - CAST(requested_ts AS DATE)) * 1440))
+        FROM   insp_tickets WHERE inspected_ts >= TRUNC(SYSDATE)) AS avg_min_submit_to_done,
+       (SELECT COUNT(*) FROM fl_tickets WHERE delivered_ts >= TRUNC(SYSDATE)) AS moves_delivered,
+       (SELECT COUNT(*) FROM fl_tickets WHERE status = 'OPEN') AS moves_waiting,
+       (SELECT ROUND(AVG((CAST(delivered_ts AS DATE) - CAST(requested_ts AS DATE)) * 1440))
+        FROM   fl_tickets WHERE delivered_ts >= TRUNC(SYSDATE)) AS avg_min_per_move
+FROM   dual
 
-  FUNCTION card (p_page NUMBER, p_icon VARCHAR2, p_title VARCHAR2,
-                 p_sub VARCHAR2, p_color VARCHAR2) RETURN VARCHAR2 IS
-  BEGIN
-    RETURN '<div onclick="apex.navigation.redirect(''' || apex_page.get_url(p_page => p_page) || ''')"'
-        || ' style="' || c_card || p_color || ';">'
-        || '<div style="font-size:36px;"><span class="fa ' || p_icon || '"></span></div>'
-        || '<div style="margin-top:10px; font-weight:bold; font-size:13px;">' || p_title || '</div>'
-        || '<div style="font-size:11px; color:#9ca3af; margin-top:4px;">' || p_sub || '</div></div>';
-  END;
-BEGIN
-  IF insp_api.has_any_role(:APP_USER) = 'N' THEN
-    RETURN NULL;
-  END IF;
 
-  v := '<div style="display:flex; flex-wrap:wrap; gap:20px; padding:0 20px 20px 20px;">';
+Region 2: "Open Inspections" (Classic Report)
 
-  -- ===== INSPECTION & FORKLIFT (every Scranton user) =====
-  v := v || hdr('Inspection &amp; Forklift (Scranton)', '#6366f1');
+SELECT t.id                 AS ticket_no,
+       t.priority,
+       t.status,
+       t.assigned_inspector AS inspector,
+       t.requested_by       AS submitted_by,
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id AND l.line_status = 'FAILED') AS failed_waiting,
+       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(t.requested_ts AS DATE)) * 24, 1) AS hours_open,
+       ROUND((CAST(SYSTIMESTAMP AS DATE)
+              - CAST(NVL((SELECT MAX(e.event_ts) FROM insp_events e
+                          WHERE  e.ticket_id = t.id AND e.to_status = t.status),
+                         t.requested_ts) AS DATE)) * 24, 1) AS hours_in_status
+FROM   insp_tickets t
+WHERE  t.status NOT IN ('CLOSED', 'CANCELLED')
+ORDER  BY CASE t.status
+            WHEN 'SUBMITTED'   THEN 1 WHEN 'PRIORITIZED' THEN 2 WHEN 'ASSIGNED'  THEN 3
+            WHEN 'IN_PROGRESS' THEN 4 WHEN 'ON_HOLD'     THEN 5 WHEN 'INSPECTED' THEN 6 END,
+          t.priority, t.requested_ts
 
-  SELECT COUNT(*) INTO n FROM insp_tickets
-  WHERE  UPPER(requested_by) = UPPER(:APP_USER) AND status NOT IN ('CLOSED', 'CANCELLED');
-  v := v || card(29, 'fa-search', 'Inspection Requests', n || ' open request(s)', '#6366f1');
 
-  IF insp_api.is_manager(:APP_USER) = 'Y' OR insp_api.has_role(:APP_USER, 'INSPECTOR') = 'Y' THEN
-    SELECT COUNT(*) INTO n FROM insp_tickets
-    WHERE  UPPER(assigned_inspector) = UPPER(:APP_USER) AND status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD');
-    v := v || card(33, 'fa-check-square-o', 'My Inspections', n || ' assigned to me', '#6366f1');
-  END IF;
 
-  SELECT COUNT(*) INTO n FROM fl_tickets WHERE status = 'OPEN';
-  v := v || card(35, 'fa-truck', 'Forklift Board', n || ' move(s) waiting', '#f97316');
+Region 3: "Forklift Drivers" (Classic Report)
 
-  -- ===== INSPECTION MANAGEMENT (Planner, Manager, Super User, Admin) =====
-  IF insp_api.is_manager(:APP_USER) = 'Y' THEN
-    v := v || hdr('Inspection Management', '#ef4444');
+SELECT f.driver,
+       COUNT(CASE WHEN f.status = 'CLAIMED'   THEN 1 END) AS claimed,
+       COUNT(CASE WHEN f.status = 'PICKED_UP' THEN 1 END) AS carrying,
+       LISTAGG('#' || f.id || ' ' || f.from_location_name || ' -> ' || f.to_location_name, '; ')
+         WITHIN GROUP (ORDER BY f.claimed_ts) AS moves,
+       ROUND(MAX((CAST(SYSTIMESTAMP AS DATE) - CAST(f.claimed_ts AS DATE)) * 1440)) AS longest_min
+FROM   fl_tickets f
+WHERE  f.status IN ('CLAIMED', 'PICKED_UP')
+GROUP  BY f.driver
+ORDER  BY f.driver
 
-    SELECT COUNT(*) INTO n FROM insp_tickets WHERE status = 'SUBMITTED';
-    v := v || card(31, 'fa-sort-numeric-asc', 'Planner Queue', n || ' need priority', '#ef4444');
 
-    SELECT COUNT(*) INTO n FROM insp_tickets WHERE status = 'PRIORITIZED';
-    SELECT COUNT(*) INTO f FROM insp_ticket_lines WHERE line_status = 'FAILED';
-    v := v || card(32, 'fa-sitemap', 'Manager Board', n || ' to assign, ' || f || ' failed', '#ef4444');
 
-    v := v || card(37, 'fa-dashboard', 'Live Board', 'Who is working on what', '#ef4444');
-    v := v || card(40, 'fa-map-marker', 'Forklift Locations', 'Pickup / drop-off points', '#ef4444');
+Dynamic Actions
 
-    IF insp_api.has_role(:APP_USER, 'ADMIN,SUPER_USER') = 'Y' THEN
-      v := v || card(39, 'fa-file-excel-o', 'Weekly Upload', 'Material Queue Report', '#ef4444');
-    END IF;
-  END IF;
+"Auto Refresh": Event Page Load → Execute JavaScript Code
 
-  RETURN v || '</div>';
-END;
+setInterval(function () {
+  ['lb_today', 'lb_insp', 'lb_fl'].forEach(function (id) {
+    if (document.getElementById(id)) { apex.region(id).refresh(); }
+  });
+}, 60000);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,220 +1,70 @@
-Step 0: Check you have an eligible driver
-
-SELECT * FROM fl_eligible_drivers_v
-
-Shared Components → Authorization Schemes → Create → From Scratch:
-
-RETURN insp_api.has_any_role(:APP_USER) = 'Y';
-
-
-Locations LOV (for P36_FROM and P36_TO):
-
-SELECT location_name || '   (' || location_type || ')' AS d, location_code AS r
-FROM   fl_locations_v
-ORDER  BY location_type DESC, location_name
-
-Process "Call Forklift" (When Button Pressed SUBMIT):
-
 DECLARE
-  v_id NUMBER;
+  c_card CONSTANT VARCHAR2(400) :=
+    'cursor:pointer; width:180px; background:#ffffff; border-radius:10px; ' ||
+    'box-shadow:0 2px 8px rgba(0,0,0,0.1); padding:24px 16px; text-align:center; border-top:4px solid ';
+  v  CLOB;
+  n  NUMBER;
+  f  NUMBER;
+
+  FUNCTION hdr (p_title VARCHAR2, p_color VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN '<div style="width:100%; margin-top:24px; margin-bottom:16px;">'
+        || '<div style="font-size:13px; font-weight:700; color:#333; text-transform:uppercase; letter-spacing:1px;">'
+        || p_title || '</div>'
+        || '<div style="height:3px; width:60px; background:' || p_color
+        || '; margin-top:6px; border-radius:2px;"></div></div>';
+  END;
+
+  FUNCTION card (p_page NUMBER, p_icon VARCHAR2, p_title VARCHAR2,
+                 p_sub VARCHAR2, p_color VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN '<div onclick="apex.navigation.redirect(''' || apex_page.get_url(p_page => p_page) || ''')"'
+        || ' style="' || c_card || p_color || ';">'
+        || '<div style="font-size:36px;"><span class="fa ' || p_icon || '"></span></div>'
+        || '<div style="margin-top:10px; font-weight:bold; font-size:13px;">' || p_title || '</div>'
+        || '<div style="font-size:11px; color:#9ca3af; margin-top:4px;">' || p_sub || '</div></div>';
+  END;
 BEGIN
-  v_id := insp_api.create_forklift(:P36_FROM, :P36_TO, :APP_USER,
-                                   :P36_JOB, :P36_OP_SEQ, :P36_COMMENT, 'FLOOR');
-  apex_application.g_print_success_message := 'Forklift move ' || v_id || ' requested.';
+  IF insp_api.has_any_role(:APP_USER) = 'N' THEN
+    RETURN NULL;
+  END IF;
+
+  v := '<div style="display:flex; flex-wrap:wrap; gap:20px; padding:0 20px 20px 20px;">';
+
+  -- ===== INSPECTION & FORKLIFT (every Scranton user) =====
+  v := v || hdr('Inspection &amp; Forklift (Scranton)', '#6366f1');
+
+  SELECT COUNT(*) INTO n FROM insp_tickets
+  WHERE  UPPER(requested_by) = UPPER(:APP_USER) AND status NOT IN ('CLOSED', 'CANCELLED');
+  v := v || card(29, 'fa-search', 'Inspection Requests', n || ' open request(s)', '#6366f1');
+
+  IF insp_api.is_manager(:APP_USER) = 'Y' OR insp_api.has_role(:APP_USER, 'INSPECTOR') = 'Y' THEN
+    SELECT COUNT(*) INTO n FROM insp_tickets
+    WHERE  UPPER(assigned_inspector) = UPPER(:APP_USER) AND status IN ('ASSIGNED', 'IN_PROGRESS', 'ON_HOLD');
+    v := v || card(33, 'fa-check-square-o', 'My Inspections', n || ' assigned to me', '#6366f1');
+  END IF;
+
+  SELECT COUNT(*) INTO n FROM fl_tickets WHERE status = 'OPEN';
+  v := v || card(35, 'fa-truck', 'Forklift Board', n || ' move(s) waiting', '#f97316');
+
+  -- ===== INSPECTION MANAGEMENT (Planner, Manager, Super User, Admin) =====
+  IF insp_api.is_manager(:APP_USER) = 'Y' THEN
+    v := v || hdr('Inspection Management', '#ef4444');
+
+    SELECT COUNT(*) INTO n FROM insp_tickets WHERE status = 'SUBMITTED';
+    v := v || card(31, 'fa-sort-numeric-asc', 'Planner Queue', n || ' need priority', '#ef4444');
+
+    SELECT COUNT(*) INTO n FROM insp_tickets WHERE status = 'PRIORITIZED';
+    SELECT COUNT(*) INTO f FROM insp_ticket_lines WHERE line_status = 'FAILED';
+    v := v || card(32, 'fa-sitemap', 'Manager Board', n || ' to assign, ' || f || ' failed', '#ef4444');
+
+    v := v || card(37, 'fa-dashboard', 'Live Board', 'Who is working on what', '#ef4444');
+    v := v || card(40, 'fa-map-marker', 'Forklift Locations', 'Pickup / drop-off points', '#ef4444');
+
+    IF insp_api.has_role(:APP_USER, 'ADMIN,SUPER_USER') = 'Y' THEN
+      v := v || card(39, 'fa-file-excel-o', 'Weekly Upload', 'Material Queue Report', '#ef4444');
+    END IF;
+  END IF;
+
+  RETURN v || '</div>';
 END;
-
-
-Pre-Rendering → Before Header → Process "Who Am I":
-
-:P35_IS_DRIVER := insp_api.is_driver(:APP_USER);
-:P35_IS_MGR    := insp_api.is_manager(:APP_USER);
-
-
-	•	Server-side Condition, PL/SQL Expression: :P35_IS_DRIVER = 'Y' OR :P35_IS_MGR = 'Y'
-
-SELECT f.id                 AS move_no,
-       f.job,
-       f.op_seq,
-       f.from_location_name AS pick_up,
-       f.to_location_name   AS drop_off,
-       f.source,
-       f.requested_by,
-       f.requested_ts       AS requested,
-       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(f.requested_ts AS DATE)) * 1440) AS minutes_waiting,
-       CASE WHEN :P35_IS_DRIVER = 'Y' THEN
-         '<button type="button" class="t-Button t-Button--small t-Button--hot fl-act" data-id="' || f.id || '" data-act="CLAIM">Claim</button>'
-       END AS actions
-FROM   fl_tickets f
-WHERE  f.status = 'OPEN'
-ORDER  BY f.requested_ts
-
-
-Condition: :P35_IS_DRIVER = 'Y'
-
-SELECT f.id                 AS move_no,
-       f.job,
-       f.op_seq,
-       f.from_location_name AS pick_up,
-       f.to_location_name   AS drop_off,
-       f.status,
-       f.claimed_ts         AS claimed,
-       f.picked_up_ts       AS picked_up,
-       CASE f.status
-         WHEN 'CLAIMED'   THEN '<button type="button" class="t-Button t-Button--small t-Button--primary fl-act" data-id="' || f.id || '" data-act="PICKUP">Picked Up</button>'
-         WHEN 'PICKED_UP' THEN '<button type="button" class="t-Button t-Button--small t-Button--success fl-act" data-id="' || f.id || '" data-act="DELIVER">Delivered</button>'
-       END AS actions
-FROM   fl_tickets f
-WHERE  UPPER(f.driver) = UPPER(:APP_USER)
-AND    f.status IN ('CLAIMED', 'PICKED_UP')
-ORDER  BY f.claimed_ts
-
-
-	•	No condition: everyone sees their own calls.
-
-
-SELECT f.id                 AS move_no,
-       f.job,
-       f.from_location_name AS pick_up,
-       f.to_location_name   AS drop_off,
-       f.status,
-       f.driver,
-       f.requested_ts       AS requested,
-       f.delivered_ts       AS delivered,
-       CASE WHEN f.status = 'OPEN' THEN
-         '<button type="button" class="t-Button t-Button--small t-Button--danger fl-act" data-id="' || f.id || '" data-act="CANCEL">Cancel</button>'
-       END AS actions
-FROM   fl_tickets f
-WHERE  UPPER(f.requested_by) = UPPER(:APP_USER)
-AND    (f.status IN ('OPEN', 'CLAIMED', 'PICKED_UP') OR f.requested_ts > SYSTIMESTAMP - INTERVAL '1' DAY)
-ORDER  BY f.requested_ts DESC
-
-
-	•	Condition: :P35_IS_MGR = 'Y'
-
-
-SELECT f.id                 AS move_no,
-       f.job,
-       f.from_location_name AS pick_up,
-       f.to_location_name   AS drop_off,
-       f.status,
-       f.driver,
-       f.requested_by,
-       f.requested_ts       AS requested,
-       f.claimed_ts         AS claimed,
-       f.picked_up_ts       AS picked_up,
-       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(f.requested_ts AS DATE)) * 1440) AS minutes_open,
-       CASE WHEN f.status IN ('CLAIMED', 'PICKED_UP') THEN
-         '<button type="button" class="t-Button t-Button--small t-Button--warning fl-act" data-id="' || f.id || '" data-act="RELEASE">Release</button> '
-       END ||
-       '<button type="button" class="t-Button t-Button--small t-Button--danger fl-act" data-id="' || f.id || '" data-act="CANCEL">Cancel</button>' AS actions
-FROM   fl_tickets f
-WHERE  f.status IN ('OPEN', 'CLAIMED', 'PICKED_UP')
-ORDER  BY f.requested_ts
-
-
-DA "Forklift Action":
-
-	•	Event Click, jQuery Selector .fl-act, Event Scope: Dynamic
-	•	True action Execute JavaScript Code:
-
-
-var b   = this.triggeringElement;
-var act = b.dataset.act;
-var set = { 'P35_FL_ID': b.dataset.id };
-
-if (act === 'CANCEL' || act === 'RELEASE') {
-  var reason = window.prompt('Reason for ' + (act === 'CANCEL' ? 'cancelling' : 'releasing') +
-                             ' move ' + b.dataset.id + ':');
-  if (!reason || !reason.trim()) { return; }
-  set['P35_REASON'] = reason.trim();
-}
-apex.page.submit({ request: act, set: set, showWait: true });
-
-
-DA "Auto Refresh":
-
-	•	Event Page Load
-	•	True action Execute JavaScript Code:
-
-setInterval(function () {
-  ['fl_pool', 'fl_mine', 'fl_req', 'fl_all'].forEach(function (id) {
-    if (document.getElementById(id)) { apex.region(id).refresh(); }
-  });
-}, 60000);
-
-
-DA "Refresh after call":
-
-	•	Event Dialog Closed, Selection Type Button, Button CALL
-	•	True action Submit Page, Request REFRESH
-
-3d. Processing
-
-Process "Forklift Action":
-
-	•	Condition: Request is contained in Value CLAIM,PICKUP,DELIVER,RELEASE,CANCEL
-
-
-BEGIN
-  CASE :REQUEST
-    WHEN 'CLAIM'   THEN insp_api.claim_forklift(:P35_FL_ID, :APP_USER);
-    WHEN 'PICKUP'  THEN insp_api.pickup_forklift(:P35_FL_ID, :APP_USER);
-    WHEN 'DELIVER' THEN insp_api.deliver_forklift(:P35_FL_ID, :APP_USER);
-    WHEN 'RELEASE' THEN insp_api.release_forklift(:P35_FL_ID, :APP_USER, :P35_REASON);
-    WHEN 'CANCEL'  THEN insp_api.cancel_forklift(:P35_FL_ID, :APP_USER, :P35_REASON);
-    ELSE RAISE_APPLICATION_ERROR(-20100, 'Unknown button: ' || :REQUEST);
-  END CASE;
-  :P35_REASON := NULL;
-END;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

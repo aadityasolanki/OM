@@ -1,18 +1,220 @@
-DELETE FROM veh_qualifications
-WHERE  level_id IN (SELECT l.id
-                    FROM   veh_equipment_levels l
-                    JOIN   veh_equipment_categories c ON c.id = l.category_id
-                    WHERE  UPPER(c.site) = 'SCRANTON'
-                    AND    UPPER(c.category_name) IN ('TEST', 'APPLE'))
+Step 0: Check you have an eligible driver
+
+SELECT * FROM fl_eligible_drivers_v
+
+Shared Components → Authorization Schemes → Create → From Scratch:
+
+RETURN insp_api.has_any_role(:APP_USER) = 'Y';
 
 
-DELETE FROM veh_equipment_levels
-WHERE  category_id IN (SELECT id FROM veh_equipment_categories
-                       WHERE  UPPER(site) = 'SCRANTON'
-                       AND    UPPER(category_name) IN ('TEST', 'APPLE'))
+Locations LOV (for P36_FROM and P36_TO):
+
+SELECT location_name || '   (' || location_type || ')' AS d, location_code AS r
+FROM   fl_locations_v
+ORDER  BY location_type DESC, location_name
+
+Process "Call Forklift" (When Button Pressed SUBMIT):
+
+DECLARE
+  v_id NUMBER;
+BEGIN
+  v_id := insp_api.create_forklift(:P36_FROM, :P36_TO, :APP_USER,
+                                   :P36_JOB, :P36_OP_SEQ, :P36_COMMENT, 'FLOOR');
+  apex_application.g_print_success_message := 'Forklift move ' || v_id || ' requested.';
+END;
+
+
+Pre-Rendering → Before Header → Process "Who Am I":
+
+:P35_IS_DRIVER := insp_api.is_driver(:APP_USER);
+:P35_IS_MGR    := insp_api.is_manager(:APP_USER);
+
+
+	•	Server-side Condition, PL/SQL Expression: :P35_IS_DRIVER = 'Y' OR :P35_IS_MGR = 'Y'
+
+SELECT f.id                 AS move_no,
+       f.job,
+       f.op_seq,
+       f.from_location_name AS pick_up,
+       f.to_location_name   AS drop_off,
+       f.source,
+       f.requested_by,
+       f.requested_ts       AS requested,
+       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(f.requested_ts AS DATE)) * 1440) AS minutes_waiting,
+       CASE WHEN :P35_IS_DRIVER = 'Y' THEN
+         '<button type="button" class="t-Button t-Button--small t-Button--hot fl-act" data-id="' || f.id || '" data-act="CLAIM">Claim</button>'
+       END AS actions
+FROM   fl_tickets f
+WHERE  f.status = 'OPEN'
+ORDER  BY f.requested_ts
+
+
+Condition: :P35_IS_DRIVER = 'Y'
+
+SELECT f.id                 AS move_no,
+       f.job,
+       f.op_seq,
+       f.from_location_name AS pick_up,
+       f.to_location_name   AS drop_off,
+       f.status,
+       f.claimed_ts         AS claimed,
+       f.picked_up_ts       AS picked_up,
+       CASE f.status
+         WHEN 'CLAIMED'   THEN '<button type="button" class="t-Button t-Button--small t-Button--primary fl-act" data-id="' || f.id || '" data-act="PICKUP">Picked Up</button>'
+         WHEN 'PICKED_UP' THEN '<button type="button" class="t-Button t-Button--small t-Button--success fl-act" data-id="' || f.id || '" data-act="DELIVER">Delivered</button>'
+       END AS actions
+FROM   fl_tickets f
+WHERE  UPPER(f.driver) = UPPER(:APP_USER)
+AND    f.status IN ('CLAIMED', 'PICKED_UP')
+ORDER  BY f.claimed_ts
+
+
+	•	No condition: everyone sees their own calls.
+
+
+SELECT f.id                 AS move_no,
+       f.job,
+       f.from_location_name AS pick_up,
+       f.to_location_name   AS drop_off,
+       f.status,
+       f.driver,
+       f.requested_ts       AS requested,
+       f.delivered_ts       AS delivered,
+       CASE WHEN f.status = 'OPEN' THEN
+         '<button type="button" class="t-Button t-Button--small t-Button--danger fl-act" data-id="' || f.id || '" data-act="CANCEL">Cancel</button>'
+       END AS actions
+FROM   fl_tickets f
+WHERE  UPPER(f.requested_by) = UPPER(:APP_USER)
+AND    (f.status IN ('OPEN', 'CLAIMED', 'PICKED_UP') OR f.requested_ts > SYSTIMESTAMP - INTERVAL '1' DAY)
+ORDER  BY f.requested_ts DESC
+
+
+	•	Condition: :P35_IS_MGR = 'Y'
+
+
+SELECT f.id                 AS move_no,
+       f.job,
+       f.from_location_name AS pick_up,
+       f.to_location_name   AS drop_off,
+       f.status,
+       f.driver,
+       f.requested_by,
+       f.requested_ts       AS requested,
+       f.claimed_ts         AS claimed,
+       f.picked_up_ts       AS picked_up,
+       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(f.requested_ts AS DATE)) * 1440) AS minutes_open,
+       CASE WHEN f.status IN ('CLAIMED', 'PICKED_UP') THEN
+         '<button type="button" class="t-Button t-Button--small t-Button--warning fl-act" data-id="' || f.id || '" data-act="RELEASE">Release</button> '
+       END ||
+       '<button type="button" class="t-Button t-Button--small t-Button--danger fl-act" data-id="' || f.id || '" data-act="CANCEL">Cancel</button>' AS actions
+FROM   fl_tickets f
+WHERE  f.status IN ('OPEN', 'CLAIMED', 'PICKED_UP')
+ORDER  BY f.requested_ts
+
+
+DA "Forklift Action":
+
+	•	Event Click, jQuery Selector .fl-act, Event Scope: Dynamic
+	•	True action Execute JavaScript Code:
+
+
+var b   = this.triggeringElement;
+var act = b.dataset.act;
+var set = { 'P35_FL_ID': b.dataset.id };
+
+if (act === 'CANCEL' || act === 'RELEASE') {
+  var reason = window.prompt('Reason for ' + (act === 'CANCEL' ? 'cancelling' : 'releasing') +
+                             ' move ' + b.dataset.id + ':');
+  if (!reason || !reason.trim()) { return; }
+  set['P35_REASON'] = reason.trim();
+}
+apex.page.submit({ request: act, set: set, showWait: true });
+
+
+DA "Auto Refresh":
+
+	•	Event Page Load
+	•	True action Execute JavaScript Code:
+
+setInterval(function () {
+  ['fl_pool', 'fl_mine', 'fl_req', 'fl_all'].forEach(function (id) {
+    if (document.getElementById(id)) { apex.region(id).refresh(); }
+  });
+}, 60000);
+
+
+DA "Refresh after call":
+
+	•	Event Dialog Closed, Selection Type Button, Button CALL
+	•	True action Submit Page, Request REFRESH
+
+3d. Processing
+
+Process "Forklift Action":
+
+	•	Condition: Request is contained in Value CLAIM,PICKUP,DELIVER,RELEASE,CANCEL
+
+
+BEGIN
+  CASE :REQUEST
+    WHEN 'CLAIM'   THEN insp_api.claim_forklift(:P35_FL_ID, :APP_USER);
+    WHEN 'PICKUP'  THEN insp_api.pickup_forklift(:P35_FL_ID, :APP_USER);
+    WHEN 'DELIVER' THEN insp_api.deliver_forklift(:P35_FL_ID, :APP_USER);
+    WHEN 'RELEASE' THEN insp_api.release_forklift(:P35_FL_ID, :APP_USER, :P35_REASON);
+    WHEN 'CANCEL'  THEN insp_api.cancel_forklift(:P35_FL_ID, :APP_USER, :P35_REASON);
+    ELSE RAISE_APPLICATION_ERROR(-20100, 'Unknown button: ' || :REQUEST);
+  END CASE;
+  :P35_REASON := NULL;
+END;
 
 
 
-DELETE FROM veh_equipment_categories
-WHERE  UPPER(site) = 'SCRANTON'
-AND    UPPER(category_name) IN ('TEST', 'APPLE')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

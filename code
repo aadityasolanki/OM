@@ -1,220 +1,86 @@
-Item	Type	Settings
-P38_FROM	Date Picker	Label From. Format Mask YYYY-MM-DD. Default → PL/SQL Expression TO_CHAR(TRUNC(SYSDATE) - 30, 'YYYY-MM-DD')
-P38_TO	Date Picker	Label To. Format Mask YYYY-MM-DD. Default → PL/SQL Expression TO_CHAR(TRUNC(SYSDATE), 'YYYY-MM-DD')
-
-4.1 Closed Tickets
-
-SELECT t.id                 AS ticket_no,
-       t.status,
-       t.priority,
-       t.requested_by       AS submitted_by,
-       t.requested_ts       AS submitted,
-       t.prioritized_by,
-       t.prioritized_ts     AS prioritized,
-       t.assigned_by,
-       t.assigned_inspector AS inspector,
-       t.assigned_ts        AS assigned,
-       t.started_ts         AS started,
-       t.inspected_ts       AS inspected,
-       t.closed_ts          AS closed,
-       t.cancelled_by,
-       t.cancel_reason,
-       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
-       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id
-        AND l.line_status IN ('PASSED', 'PASSED_FORKLIFT')) AS jobs_passed,
-       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id
-        AND l.line_status IN ('FAILED', 'FAILED_CLOSED')) AS jobs_failed,
-       ROUND((CAST(t.prioritized_ts AS DATE) - CAST(t.requested_ts   AS DATE)) * 1440) AS min_to_priority,
-       ROUND((CAST(t.assigned_ts    AS DATE) - CAST(t.prioritized_ts AS DATE)) * 1440) AS min_to_assign,
-       ROUND((CAST(t.started_ts     AS DATE) - CAST(t.assigned_ts    AS DATE)) * 1440) AS min_to_start,
-       ROUND(((CAST(t.inspected_ts  AS DATE) - CAST(t.started_ts     AS DATE)) * 86400
-              - NVL(t.hold_seconds, 0)) / 60)                                         AS inspect_min,
-       ROUND(NVL(t.hold_seconds, 0) / 60)                                             AS hold_min,
-       ROUND((CAST(NVL(t.closed_ts, t.cancelled_ts) AS DATE) - CAST(t.requested_ts AS DATE)) * 1440) AS total_min
-FROM   insp_tickets t
-WHERE  t.status IN ('CLOSED', 'CANCELLED')
-AND    t.requested_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
-AND    t.requested_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
-ORDER  BY t.id DESC
-
-Job Results
-
-SELECT l.ticket_id         AS ticket_no,
-       l.line_no,
-       l.job,
-       l.op_seq,
-       l.assembly_number,
-       l.assy_description,
-       l.dept,
-       l.plnr,
-       l.project,
-       l.qty,
-       l.from_location_name AS location,
-       CASE l.line_status
-         WHEN 'PASSED'          THEN 'Completed'
-         WHEN 'PASSED_FORKLIFT' THEN 'Completed - forklift'
-         WHEN 'FAILED'          THEN 'Failed - with manager'
-         WHEN 'FAILED_CLOSED'   THEN 'Failed - closed'
-         ELSE 'Open'
-       END                  AS result,
-       l.result_by,
-       l.result_ts          AS result_time,
-       l.failed_closed_by,
-       l.failed_closed_ts   AS failed_closed_time,
-       (SELECT MAX(c.comment_text) KEEP (DENSE_RANK LAST ORDER BY c.comment_ts)
-        FROM   insp_comments c WHERE c.ticket_line_id = l.id) AS last_comment,
-       (SELECT MAX(f.id || ' - ' || f.status) FROM fl_tickets f WHERE f.ticket_line_id = l.id) AS forklift_move
-FROM   insp_ticket_lines l
-JOIN   insp_tickets t ON t.id = l.ticket_id
-WHERE  t.requested_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
-AND    t.requested_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
-ORDER  BY l.ticket_id DESC, l.line_no
-
-
-Inspectors
-
-SELECT x.inspector,
-       (SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
-        WHERE  UPPER(i.shortname) = UPPER(x.inspector)) AS inspector_name,
-       COUNT(*)                     AS tickets,
-       SUM(x.jobs)                  AS jobs,
-       SUM(x.failed)                AS jobs_failed,
-       ROUND(100 * SUM(x.failed) / NULLIF(SUM(x.jobs), 0), 1) AS fail_pct,
-       ROUND(AVG(x.min_to_start))   AS avg_min_to_start,
-       ROUND(AVG(x.inspect_min))    AS avg_inspect_min,
-       ROUND(SUM(x.inspect_min) / 60, 1) AS total_inspect_hours
-FROM  (SELECT t.assigned_inspector AS inspector,
-              (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
-              (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id
-               AND l.line_status IN ('FAILED', 'FAILED_CLOSED')) AS failed,
-              (CAST(t.started_ts AS DATE) - CAST(t.assigned_ts AS DATE)) * 1440 AS min_to_start,
-              ((CAST(t.inspected_ts AS DATE) - CAST(t.started_ts AS DATE)) * 86400
-               - NVL(t.hold_seconds, 0)) / 60 AS inspect_min
-       FROM   insp_tickets t
-       WHERE  t.inspected_ts IS NOT NULL
-       AND    t.inspected_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
-       AND    t.inspected_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1) x
-GROUP  BY x.inspector
-ORDER  BY tickets DESC
-
-
-4.4 Failure by Assembly
-
-
-SELECT l.assembly_number,
-       MAX(l.assy_description)  AS assy_description,
-       COUNT(*)                 AS jobs_inspected,
-       COUNT(CASE WHEN l.line_status IN ('FAILED', 'FAILED_CLOSED') THEN 1 END) AS jobs_failed,
-       ROUND(100 * COUNT(CASE WHEN l.line_status IN ('FAILED', 'FAILED_CLOSED') THEN 1 END)
-             / COUNT(*), 1)     AS fail_pct,
-       MAX(CASE WHEN l.line_status IN ('FAILED', 'FAILED_CLOSED') THEN l.result_ts END) AS last_failed
-FROM   insp_ticket_lines l
-WHERE  l.line_status <> 'OPEN'
-AND    l.result_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
-AND    l.result_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
-GROUP  BY l.assembly_number
-ORDER  BY jobs_failed DESC, fail_pct DESC
-
-
-Drivers
-
-SELECT f.driver,
-       (SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
-        WHERE  UPPER(i.shortname) = UPPER(f.driver)) AS driver_name,
-       COUNT(*)                                            AS moves,
-       COUNT(CASE WHEN f.source = 'INSPECTION' THEN 1 END) AS from_inspection,
-       COUNT(CASE WHEN f.source = 'FLOOR'      THEN 1 END) AS floor_calls,
-       ROUND(AVG((CAST(f.claimed_ts   AS DATE) - CAST(f.requested_ts AS DATE)) * 1440)) AS avg_min_to_claim,
-       ROUND(AVG((CAST(f.delivered_ts AS DATE) - CAST(f.claimed_ts   AS DATE)) * 1440)) AS avg_min_claim_to_deliver,
-       ROUND(AVG((CAST(f.delivered_ts AS DATE) - CAST(f.requested_ts AS DATE)) * 1440)) AS avg_total_min
-FROM   fl_tickets f
-WHERE  f.status = 'DELIVERED'
-AND    f.delivered_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
-AND    f.delivered_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
-GROUP  BY f.driver
-ORDER  BY moves DESC
-
-
-
-4.6 Forklift Log
-
-SELECT f.id                 AS move_no,
-       f.source,
-       f.job,
-       f.op_seq,
-       f.from_location_name AS pick_up,
-       f.to_location_name   AS drop_off,
-       f.status,
-       f.requested_by,
-       f.requested_ts       AS requested,
-       f.driver,
-       f.claimed_ts         AS claimed,
-       f.picked_up_ts       AS picked_up,
-       f.delivered_ts       AS delivered,
-       f.cancelled_by,
-       f.cancel_reason,
-       ROUND((CAST(NVL(f.delivered_ts, f.cancelled_ts) AS DATE) - CAST(f.requested_ts AS DATE)) * 1440) AS total_min,
-       (SELECT l.ticket_id FROM insp_ticket_lines l WHERE l.id = f.ticket_line_id) AS inspection_ticket
-FROM   fl_tickets f
-WHERE  f.requested_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
-AND    f.requested_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
-ORDER  BY f.id DESC
-
-
-
-
-    v := v || card(38, 'fa-history', 'History &amp; Reports', 'Times, failures, moves', '#ef4444');
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+-- =============================================================================
+-- GDLS OMS | App 260 | GD_SANDBOX
+-- One-time load: Anniston employees from USERS into APP_USER_ROLES (FLOOR_OP)
+-- Same method as the Lima migration (Aug-2026).
+-- Run in SQL Workshop -> SQL Scripts (not SQL Commands). Upload this file unchanged.
+-- Safe to re-run: people already in APP_USER_ROLES for Anniston are never changed.
+-- Export App 260 before running.
+-- =============================================================================
+
+-- 0. BEFORE: how many Anniston people are in USERS, and how many are already set up
+SELECT COUNT(*)                                   AS anniston_in_users,
+       COUNT(emplid)                              AS with_l_number,
+       COUNT(unixid)                              AS with_login,
+       COUNT(CASE WHEN EXISTS (SELECT 1 FROM app_user_roles a
+                               WHERE UPPER(a.unixid) = UPPER(u.unixid)
+                               AND   UPPER(a.site)   = 'ANNISTON') THEN 1 END) AS already_in_app_user_roles
+FROM   users u
+WHERE  UPPER(u.site) = 'ANNISTON';
+
+-- 1. Tidy the L-numbers you typed (upper case, no spaces)
+UPDATE users
+SET    emplid = UPPER(TRIM(emplid))
+WHERE  UPPER(site) = 'ANNISTON'
+AND    emplid IS NOT NULL
+AND    emplid <> UPPER(TRIM(emplid));
+
+-- 2. Fill the login (unixid) from IDM for Anniston rows that have an L-number but no login.
+--    If a person has two IDM accounts (IT staff: regular + admin "_a"), the regular one is used.
+UPDATE users u
+SET    u.unixid = (SELECT MIN(i.shortname) KEEP (DENSE_RANK FIRST ORDER BY
+                            CASE WHEN i.last_name LIKE '%\_a' ESCAPE '\' THEN 1 ELSE 0 END,
+                            i.shortname)
+                   FROM   idm_personnel_v i
+                   WHERE  UPPER(i.hr_number) = u.emplid)
+WHERE  UPPER(u.site) = 'ANNISTON'
+AND    u.emplid IS NOT NULL
+AND    u.unixid IS NULL;
+
+-- 3. Add everyone who is not in APP_USER_ROLES for Anniston yet, as FLOOR_OP.
+--    Roles can be changed afterwards on Page 16. One row per login (duplicates in USERS collapsed).
+MERGE INTO app_user_roles t
+USING (SELECT UPPER(u.unixid) AS unixid,
+              MIN(u.emplid)   AS emplid
+       FROM   users u
+       WHERE  UPPER(u.site) = 'ANNISTON'
+       AND    u.unixid IS NOT NULL
+       AND    u.emplid IS NOT NULL
+       GROUP  BY UPPER(u.unixid)) s
+ON (UPPER(t.unixid) = s.unixid AND UPPER(t.site) = 'ANNISTON')
+WHEN NOT MATCHED THEN
+  INSERT (unixid, role_code, site, is_active, created_by, created_date, emplid)
+  VALUES (s.unixid, 'FLOOR_OP', 'Anniston', 'Y', 'SOLANKIA', SYSDATE, s.emplid);
+
+-- 4. Fill any missing L-number on Anniston rows that were already in APP_USER_ROLES
+UPDATE app_user_roles a
+SET    a.emplid = (SELECT MIN(u.emplid) FROM users u
+                   WHERE  UPPER(u.unixid) = UPPER(a.unixid)
+                   AND    UPPER(u.site)   = 'ANNISTON')
+WHERE  UPPER(a.site) = 'ANNISTON'
+AND    a.emplid IS NULL;
+
+COMMIT;
+
+-- 5. AFTER: Anniston users in APP_USER_ROLES by role
+SELECT role_code, COUNT(*) AS users, COUNT(emplid) AS with_l_number
+FROM   app_user_roles
+WHERE  UPPER(site) = 'ANNISTON'
+GROUP  BY role_code
+ORDER  BY role_code;
+
+-- 6. Who could NOT be added: L-number not found in IDM (typo, or person has left)
+SELECT u.id, u.emplid, u.first_name, u.last_name
+FROM   users u
+WHERE  UPPER(u.site) = 'ANNISTON'
+AND    u.emplid IS NOT NULL
+AND    u.unixid IS NULL
+ORDER  BY u.last_name;
+
+-- 7. Who has no L-number at all in USERS yet
+SELECT u.id, u.unixid, u.first_name, u.last_name
+FROM   users u
+WHERE  UPPER(u.site) = 'ANNISTON'
+AND    u.emplid IS NULL
+ORDER  BY u.last_name;
+
+-- END OF FILE anniston_user_load.sql

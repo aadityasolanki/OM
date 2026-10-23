@@ -1,66 +1,207 @@
-Static ID lb_today. Set Attributes → Template to Badge List, which shows each number as a large tile.
+Item	Type	Settings
+P38_FROM	Date Picker	Label From. Format Mask YYYY-MM-DD. Default → PL/SQL Expression TO_CHAR(TRUNC(SYSDATE) - 30, 'YYYY-MM-DD')
+P38_TO	Date Picker	Label To. Format Mask YYYY-MM-DD. Default → PL/SQL Expression TO_CHAR(TRUNC(SYSDATE), 'YYYY-MM-DD')
 
-SELECT (SELECT COUNT(*) FROM insp_tickets WHERE requested_ts >= TRUNC(SYSDATE)) AS submitted,
-       (SELECT COUNT(*) FROM insp_tickets WHERE closed_ts    >= TRUNC(SYSDATE)) AS closed,
-       (SELECT COUNT(*) FROM insp_tickets WHERE status NOT IN ('CLOSED', 'CANCELLED')) AS open_tickets,
-       (SELECT COUNT(*) FROM insp_ticket_lines
-        WHERE  result_ts >= TRUNC(SYSDATE) AND line_status IN ('FAILED', 'FAILED_CLOSED')) AS jobs_failed,
-       (SELECT ROUND(AVG((CAST(inspected_ts AS DATE) - CAST(requested_ts AS DATE)) * 1440))
-        FROM   insp_tickets WHERE inspected_ts >= TRUNC(SYSDATE)) AS avg_min_submit_to_done,
-       (SELECT COUNT(*) FROM fl_tickets WHERE delivered_ts >= TRUNC(SYSDATE)) AS moves_delivered,
-       (SELECT COUNT(*) FROM fl_tickets WHERE status = 'OPEN') AS moves_waiting,
-       (SELECT ROUND(AVG((CAST(delivered_ts AS DATE) - CAST(requested_ts AS DATE)) * 1440))
-        FROM   fl_tickets WHERE delivered_ts >= TRUNC(SYSDATE)) AS avg_min_per_move
-FROM   dual
-
-
-Region 2: "Open Inspections" (Classic Report)
+4.1 Closed Tickets
 
 SELECT t.id                 AS ticket_no,
-       t.priority,
        t.status,
-       t.assigned_inspector AS inspector,
+       t.priority,
        t.requested_by       AS submitted_by,
+       t.requested_ts       AS submitted,
+       t.prioritized_by,
+       t.prioritized_ts     AS prioritized,
+       t.assigned_by,
+       t.assigned_inspector AS inspector,
+       t.assigned_ts        AS assigned,
+       t.started_ts         AS started,
+       t.inspected_ts       AS inspected,
+       t.closed_ts          AS closed,
+       t.cancelled_by,
+       t.cancel_reason,
        (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
-       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id AND l.line_status = 'FAILED') AS failed_waiting,
-       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(t.requested_ts AS DATE)) * 24, 1) AS hours_open,
-       ROUND((CAST(SYSTIMESTAMP AS DATE)
-              - CAST(NVL((SELECT MAX(e.event_ts) FROM insp_events e
-                          WHERE  e.ticket_id = t.id AND e.to_status = t.status),
-                         t.requested_ts) AS DATE)) * 24, 1) AS hours_in_status
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id
+        AND l.line_status IN ('PASSED', 'PASSED_FORKLIFT')) AS jobs_passed,
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id
+        AND l.line_status IN ('FAILED', 'FAILED_CLOSED')) AS jobs_failed,
+       ROUND((CAST(t.prioritized_ts AS DATE) - CAST(t.requested_ts   AS DATE)) * 1440) AS min_to_priority,
+       ROUND((CAST(t.assigned_ts    AS DATE) - CAST(t.prioritized_ts AS DATE)) * 1440) AS min_to_assign,
+       ROUND((CAST(t.started_ts     AS DATE) - CAST(t.assigned_ts    AS DATE)) * 1440) AS min_to_start,
+       ROUND(((CAST(t.inspected_ts  AS DATE) - CAST(t.started_ts     AS DATE)) * 86400
+              - NVL(t.hold_seconds, 0)) / 60)                                         AS inspect_min,
+       ROUND(NVL(t.hold_seconds, 0) / 60)                                             AS hold_min,
+       ROUND((CAST(NVL(t.closed_ts, t.cancelled_ts) AS DATE) - CAST(t.requested_ts AS DATE)) * 1440) AS total_min
 FROM   insp_tickets t
-WHERE  t.status NOT IN ('CLOSED', 'CANCELLED')
-ORDER  BY CASE t.status
-            WHEN 'SUBMITTED'   THEN 1 WHEN 'PRIORITIZED' THEN 2 WHEN 'ASSIGNED'  THEN 3
-            WHEN 'IN_PROGRESS' THEN 4 WHEN 'ON_HOLD'     THEN 5 WHEN 'INSPECTED' THEN 6 END,
-          t.priority, t.requested_ts
+WHERE  t.status IN ('CLOSED', 'CANCELLED')
+AND    t.requested_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
+AND    t.requested_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
+ORDER  BY t.id DESC
+
+Job Results
+
+SELECT l.ticket_id         AS ticket_no,
+       l.line_no,
+       l.job,
+       l.op_seq,
+       l.assembly_number,
+       l.assy_description,
+       l.dept,
+       l.plnr,
+       l.project,
+       l.qty,
+       l.from_location_name AS location,
+       CASE l.line_status
+         WHEN 'PASSED'          THEN 'Completed'
+         WHEN 'PASSED_FORKLIFT' THEN 'Completed - forklift'
+         WHEN 'FAILED'          THEN 'Failed - with manager'
+         WHEN 'FAILED_CLOSED'   THEN 'Failed - closed'
+         ELSE 'Open'
+       END                  AS result,
+       l.result_by,
+       l.result_ts          AS result_time,
+       l.failed_closed_by,
+       l.failed_closed_ts   AS failed_closed_time,
+       (SELECT MAX(c.comment_text) KEEP (DENSE_RANK LAST ORDER BY c.comment_ts)
+        FROM   insp_comments c WHERE c.ticket_line_id = l.id) AS last_comment,
+       (SELECT MAX(f.id || ' - ' || f.status) FROM fl_tickets f WHERE f.ticket_line_id = l.id) AS forklift_move
+FROM   insp_ticket_lines l
+JOIN   insp_tickets t ON t.id = l.ticket_id
+WHERE  t.requested_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
+AND    t.requested_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
+ORDER  BY l.ticket_id DESC, l.line_no
 
 
+Inspectors
 
-Region 3: "Forklift Drivers" (Classic Report)
+SELECT x.inspector,
+       (SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
+        WHERE  UPPER(i.shortname) = UPPER(x.inspector)) AS inspector_name,
+       COUNT(*)                     AS tickets,
+       SUM(x.jobs)                  AS jobs,
+       SUM(x.failed)                AS jobs_failed,
+       ROUND(100 * SUM(x.failed) / NULLIF(SUM(x.jobs), 0), 1) AS fail_pct,
+       ROUND(AVG(x.min_to_start))   AS avg_min_to_start,
+       ROUND(AVG(x.inspect_min))    AS avg_inspect_min,
+       ROUND(SUM(x.inspect_min) / 60, 1) AS total_inspect_hours
+FROM  (SELECT t.assigned_inspector AS inspector,
+              (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
+              (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id
+               AND l.line_status IN ('FAILED', 'FAILED_CLOSED')) AS failed,
+              (CAST(t.started_ts AS DATE) - CAST(t.assigned_ts AS DATE)) * 1440 AS min_to_start,
+              ((CAST(t.inspected_ts AS DATE) - CAST(t.started_ts AS DATE)) * 86400
+               - NVL(t.hold_seconds, 0)) / 60 AS inspect_min
+       FROM   insp_tickets t
+       WHERE  t.inspected_ts IS NOT NULL
+       AND    t.inspected_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
+       AND    t.inspected_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1) x
+GROUP  BY x.inspector
+ORDER  BY tickets DESC
+
+
+4.4 Failure by Assembly
+
+
+SELECT l.assembly_number,
+       MAX(l.assy_description)  AS assy_description,
+       COUNT(*)                 AS jobs_inspected,
+       COUNT(CASE WHEN l.line_status IN ('FAILED', 'FAILED_CLOSED') THEN 1 END) AS jobs_failed,
+       ROUND(100 * COUNT(CASE WHEN l.line_status IN ('FAILED', 'FAILED_CLOSED') THEN 1 END)
+             / COUNT(*), 1)     AS fail_pct,
+       MAX(CASE WHEN l.line_status IN ('FAILED', 'FAILED_CLOSED') THEN l.result_ts END) AS last_failed
+FROM   insp_ticket_lines l
+WHERE  l.line_status <> 'OPEN'
+AND    l.result_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
+AND    l.result_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
+GROUP  BY l.assembly_number
+ORDER  BY jobs_failed DESC, fail_pct DESC
+
+
+Drivers
 
 SELECT f.driver,
-       COUNT(CASE WHEN f.status = 'CLAIMED'   THEN 1 END) AS claimed,
-       COUNT(CASE WHEN f.status = 'PICKED_UP' THEN 1 END) AS carrying,
-       LISTAGG('#' || f.id || ' ' || f.from_location_name || ' -> ' || f.to_location_name, '; ')
-         WITHIN GROUP (ORDER BY f.claimed_ts) AS moves,
-       ROUND(MAX((CAST(SYSTIMESTAMP AS DATE) - CAST(f.claimed_ts AS DATE)) * 1440)) AS longest_min
+       (SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
+        WHERE  UPPER(i.shortname) = UPPER(f.driver)) AS driver_name,
+       COUNT(*)                                            AS moves,
+       COUNT(CASE WHEN f.source = 'INSPECTION' THEN 1 END) AS from_inspection,
+       COUNT(CASE WHEN f.source = 'FLOOR'      THEN 1 END) AS floor_calls,
+       ROUND(AVG((CAST(f.claimed_ts   AS DATE) - CAST(f.requested_ts AS DATE)) * 1440)) AS avg_min_to_claim,
+       ROUND(AVG((CAST(f.delivered_ts AS DATE) - CAST(f.claimed_ts   AS DATE)) * 1440)) AS avg_min_claim_to_deliver,
+       ROUND(AVG((CAST(f.delivered_ts AS DATE) - CAST(f.requested_ts AS DATE)) * 1440)) AS avg_total_min
 FROM   fl_tickets f
-WHERE  f.status IN ('CLAIMED', 'PICKED_UP')
+WHERE  f.status = 'DELIVERED'
+AND    f.delivered_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
+AND    f.delivered_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
 GROUP  BY f.driver
-ORDER  BY f.driver
+ORDER  BY moves DESC
 
 
 
-Dynamic Actions
+4.6 Forklift Log
 
-"Auto Refresh": Event Page Load → Execute JavaScript Code
+SELECT f.id                 AS move_no,
+       f.source,
+       f.job,
+       f.op_seq,
+       f.from_location_name AS pick_up,
+       f.to_location_name   AS drop_off,
+       f.status,
+       f.requested_by,
+       f.requested_ts       AS requested,
+       f.driver,
+       f.claimed_ts         AS claimed,
+       f.picked_up_ts       AS picked_up,
+       f.delivered_ts       AS delivered,
+       f.cancelled_by,
+       f.cancel_reason,
+       ROUND((CAST(NVL(f.delivered_ts, f.cancelled_ts) AS DATE) - CAST(f.requested_ts AS DATE)) * 1440) AS total_min,
+       (SELECT l.ticket_id FROM insp_ticket_lines l WHERE l.id = f.ticket_line_id) AS inspection_ticket
+FROM   fl_tickets f
+WHERE  f.requested_ts >= TO_DATE(:P38_FROM, 'YYYY-MM-DD')
+AND    f.requested_ts <  TO_DATE(:P38_TO,   'YYYY-MM-DD') + 1
+ORDER  BY f.id DESC
 
-setInterval(function () {
-  ['lb_today', 'lb_insp', 'lb_fl'].forEach(function (id) {
-    if (document.getElementById(id)) { apex.region(id).refresh(); }
-  });
-}, 60000);
+
+
+
+    v := v || card(38, 'fa-history', 'History &amp; Reports', 'Times, failures, moves', '#ef4444');
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

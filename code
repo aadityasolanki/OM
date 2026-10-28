@@ -1,63 +1,18 @@
-/* ---- Forklift Board: big touch targets for rugged tablets ---- */
-
-/* Claim / Picked Up / Delivered / Cancel / Release */
-.fl-act {
-  font-size: 20px !important;
-  font-weight: 700 !important;
-  min-width: 170px;
-  min-height: 60px;
-  padding: 14px 26px !important;
-  border-radius: 10px !important;
-  margin: 4px 0;
-}
-.fl-act + .fl-act { margin-left: 14px; }     /* space between Release and Cancel */
-
-/* Bigger, easier-to-read rows */
-#fl_pool td, #fl_mine td, #fl_req td, #fl_all td {
-  font-size: 17px;
-  padding-top: 14px !important;
-  padding-bottom: 14px !important;
-  vertical-align: middle;
-}
-#fl_pool th, #fl_mine th, #fl_req th, #fl_all th { font-size: 15px; }
-
-/* Region titles */
-#fl_pool .t-Region-title, #fl_mine .t-Region-title,
-#fl_req .t-Region-title,  #fl_all .t-Region-title { font-size: 22px; }
-
-/* Call Forklift button */
-.fl-big {
-  font-size: 22px !important;
-  font-weight: 700 !important;
-  min-height: 64px;
-  padding: 16px 32px !important;
-  border-radius: 10px !important;
-}
-
-Page 36, Call Forklift (also opened on the tablet)
-
-Page → CSS → Inline:
-
-/* Call Forklift: big fields and buttons for tablets */
-.t-Dialog-body .t-Form-fieldContainer input,
-.t-Dialog-body .t-Form-fieldContainer textarea,
-.t-Dialog-body .t-Form-fieldContainer select {
-  font-size: 18px !important;
-  min-height: 52px;
-}
-.t-Dialog-body .t-Form-label { font-size: 16px; }
-.t-Button {
-  font-size: 20px !important;
-  min-height: 60px;
-  padding: 14px 28px !important;
-  border-radius: 10px !important;
-}
-
-
-
-
-
-
-
-
-
+SELECT t.id,
+       t.id            AS ticket_no,
+       t.status,
+       t.priority,
+       t.requested_ts  AS submitted,
+       t.requested_by  AS submitted_by,
+       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
+       (SELECT LISTAGG(l.job || ' / ' || l.op_seq, ', ') WITHIN GROUP (ORDER BY l.line_no)
+        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS job_list,
+       (SELECT LISTAGG(l.assembly_number || ' - ' || l.assy_description, ', ') WITHIN GROUP (ORDER BY l.line_no)
+        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS assembly_list,
+       (SELECT MIN(q.due_date)
+        FROM   insp_ticket_lines l
+        JOIN   mq_material_queue q ON q.job = l.job AND q.op_seq = l.op_seq
+        WHERE  l.ticket_id = t.id) AS earliest_due,
+       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(t.requested_ts AS DATE)) * 24, 1) AS hours_waiting
+FROM   insp_tickets t
+WHERE  t.status IN ('SUBMITTED', 'PRIORITIZED')

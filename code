@@ -1,18 +1,428 @@
-SELECT t.id,
-       t.id            AS ticket_no,
-       t.status,
-       t.priority,
-       t.requested_ts  AS submitted,
-       t.requested_by  AS submitted_by,
-       (SELECT COUNT(*) FROM insp_ticket_lines l WHERE l.ticket_id = t.id) AS jobs,
-       (SELECT LISTAGG(l.job || ' / ' || l.op_seq, ', ') WITHIN GROUP (ORDER BY l.line_no)
-        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS job_list,
-       (SELECT LISTAGG(l.assembly_number || ' - ' || l.assy_description, ', ') WITHIN GROUP (ORDER BY l.line_no)
-        FROM   insp_ticket_lines l WHERE l.ticket_id = t.id) AS assembly_list,
-       (SELECT MIN(q.due_date)
-        FROM   insp_ticket_lines l
-        JOIN   mq_material_queue q ON q.job = l.job AND q.op_seq = l.op_seq
-        WHERE  l.ticket_id = t.id) AS earliest_due,
-       ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(t.requested_ts AS DATE)) * 24, 1) AS hours_waiting
-FROM   insp_tickets t
-WHERE  t.status IN ('SUBMITTED', 'PRIORITIZED')
+-- =============================================================================
+-- GDLS OMS | App 260 | GD_SANDBOX
+-- Manager Leave Request (MLR) - PHASE 1: tables, calendar view, package MLR_API
+-- Run ONCE in SQL Workshop -> SQL Scripts (not SQL Commands). Upload unchanged.
+-- Creates 2 tables, 1 view, 1 package. Does not touch existing tables.
+-- =============================================================================
+
+-- 1. Leave requests (one row per request; never deleted)
+CREATE TABLE mlr_requests (
+  id                NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  site              VARCHAR2(100)  NOT NULL,
+  requester         VARCHAR2(100)  NOT NULL,
+  emplid            VARCHAR2(20),
+  start_date        DATE           NOT NULL,
+  end_date          DATE           NOT NULL,
+  start_time        VARCHAR2(5),
+  end_time          VARCHAR2(5),
+  comments          VARCHAR2(4000),
+  status            VARCHAR2(20)   DEFAULT 'PENDING' NOT NULL,
+  approver1         VARCHAR2(100),
+  approver2         VARCHAR2(100),
+  submitted_ts      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+  changed_ts        TIMESTAMP,
+  decided_by        VARCHAR2(100),
+  decided_level     VARCHAR2(20),
+  decided_ts        TIMESTAMP,
+  decision_comment  VARCHAR2(4000),
+  cancelled_by      VARCHAR2(100),
+  cancelled_ts      TIMESTAMP,
+  cancel_reason     VARCHAR2(1000),
+  CONSTRAINT ck_mlr_status  CHECK (status IN ('PENDING','APPROVED','REJECTED','CANCELLED')),
+  CONSTRAINT ck_mlr_dates   CHECK (end_date >= start_date),
+  CONSTRAINT ck_mlr_endtime CHECK (end_time IS NULL OR start_date = end_date),
+  CONSTRAINT ck_mlr_level   CHECK (decided_level IS NULL OR decided_level IN ('SUPERVISOR','NEXT_LEVEL','ADMIN'))
+);
+
+CREATE INDEX idx_mlr_site_dates ON mlr_requests (site, start_date, end_date);
+CREATE INDEX idx_mlr_requester  ON mlr_requests (requester);
+CREATE INDEX idx_mlr_approver1  ON mlr_requests (approver1);
+CREATE INDEX idx_mlr_approver2  ON mlr_requests (approver2);
+CREATE INDEX idx_mlr_status     ON mlr_requests (status);
+
+-- 2. Event log - every action, who and when
+CREATE TABLE mlr_events (
+  id           NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  request_id   NUMBER         NOT NULL,
+  event_code   VARCHAR2(30)   NOT NULL,
+  from_status  VARCHAR2(20),
+  to_status    VARCHAR2(20),
+  event_by     VARCHAR2(100)  NOT NULL,
+  event_ts     TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+  note         VARCHAR2(4000),
+  CONSTRAINT fk_mle_request FOREIGN KEY (request_id) REFERENCES mlr_requests(id)
+);
+
+CREATE INDEX idx_mle_request ON mlr_events (request_id);
+
+-- 3. Calendar view: active leave with start/end date-times for the APEX Calendar region
+CREATE OR REPLACE VIEW mlr_calendar_v AS
+SELECT r.id,
+       r.site,
+       r.requester,
+       r.status,
+       NVL((SELECT MIN(i.last_name || ', ' || i.first_name)
+            FROM   idm_personnel_v i
+            WHERE  UPPER(i.shortname) = UPPER(r.requester)), r.requester) AS person_name,
+       CASE WHEN r.start_time IS NOT NULL
+            THEN r.start_date + (TO_NUMBER(SUBSTR(r.start_time, 1, 2)) * 60
+                                 + TO_NUMBER(SUBSTR(r.start_time, 4, 2))) / 1440
+            ELSE r.start_date END AS cal_start,
+       CASE WHEN r.end_time IS NOT NULL
+            THEN r.end_date + (TO_NUMBER(SUBSTR(r.end_time, 1, 2)) * 60
+                               + TO_NUMBER(SUBSTR(r.end_time, 4, 2))) / 1440
+            WHEN r.start_time IS NOT NULL
+            THEN r.end_date + 1439 / 1440
+            ELSE r.end_date END AS cal_end,
+       CASE WHEN r.start_time IS NULL AND r.end_time IS NULL THEN 'Y' ELSE 'N' END AS all_day,
+       r.start_date,
+       r.end_date,
+       r.start_time,
+       r.end_time
+FROM   mlr_requests r
+WHERE  r.status IN ('PENDING', 'APPROVED');
+
+-- 4. Package spec
+CREATE OR REPLACE PACKAGE mlr_api AS
+
+  -- roles that may request leave (one place to change)
+  c_roles CONSTANT VARCHAR2(200) := 'MANAGER,PLANNER,HR,SUPERVISOR,SUPER_USER,ADMIN';
+
+  FUNCTION can_request   (p_user VARCHAR2) RETURN VARCHAR2;                 -- 'Y'/'N'
+  FUNCTION is_all_sites  (p_user VARCHAR2) RETURN VARCHAR2;                 -- ALL / All Sites user
+  FUNCTION can_see_site  (p_user VARCHAR2, p_site VARCHAR2) RETURN VARCHAR2;
+  FUNCTION supervisor_of (p_user VARCHAR2) RETURN VARCHAR2;                 -- IDM supervisor_id
+  FUNCTION can_decide    (p_id NUMBER, p_user VARCHAR2) RETURN VARCHAR2;    -- may approve/reject now
+
+  FUNCTION submit_request (p_user VARCHAR2, p_site VARCHAR2,
+                           p_start DATE, p_end DATE,
+                           p_start_time VARCHAR2, p_end_time VARCHAR2,
+                           p_comment VARCHAR2) RETURN NUMBER;
+
+  PROCEDURE change_request (p_id NUMBER, p_user VARCHAR2,
+                            p_start DATE, p_end DATE,
+                            p_start_time VARCHAR2, p_end_time VARCHAR2,
+                            p_comment VARCHAR2);
+
+  PROCEDURE cancel_request (p_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2);
+
+  PROCEDURE decide (p_id NUMBER, p_user VARCHAR2, p_decision VARCHAR2, p_comment VARCHAR2);
+
+END mlr_api;
+/
+
+-- 5. Package body
+CREATE OR REPLACE PACKAGE BODY mlr_api AS
+
+  -- ---------------------------------------------------------------- helpers
+  PROCEDURE fail (p_msg VARCHAR2) IS
+  BEGIN
+    RAISE_APPLICATION_ERROR(-20200, p_msg);
+  END;
+
+  PROCEDURE log_event (p_id NUMBER, p_code VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                       p_user VARCHAR2, p_note VARCHAR2 DEFAULT NULL) IS
+  BEGIN
+    INSERT INTO mlr_events (request_id, event_code, from_status, to_status, event_by, note)
+    VALUES (p_id, p_code, p_from, p_to, UPPER(p_user), p_note);
+  END;
+
+  FUNCTION in_list (p_value VARCHAR2, p_list VARCHAR2) RETURN BOOLEAN IS
+  BEGIN
+    RETURN INSTR(',' || UPPER(REPLACE(p_list, ' ', '')) || ',', ',' || UPPER(p_value) || ',') > 0;
+  END;
+
+  -- user has an eligible role at this site (or an eligible ALL-sites row)
+  FUNCTION role_at_site (p_user VARCHAR2, p_site VARCHAR2) RETURN BOOLEAN IS
+    n NUMBER := 0;
+  BEGIN
+    FOR r IN (SELECT role_code, site FROM app_user_roles
+              WHERE  UPPER(unixid) = UPPER(p_user) AND is_active = 'Y')
+    LOOP
+      IF in_list(r.role_code, c_roles)
+         AND (UPPER(r.site) = UPPER(p_site) OR UPPER(r.site) IN ('ALL', 'ALL SITES')) THEN
+        n := n + 1;
+      END IF;
+    END LOOP;
+    RETURN n > 0;
+  END;
+
+  FUNCTION has_account (p_user VARCHAR2) RETURN BOOLEAN IS
+    n NUMBER;
+  BEGIN
+    IF p_user IS NULL THEN RETURN FALSE; END IF;
+    SELECT COUNT(*) INTO n FROM app_user_roles
+    WHERE  UPPER(unixid) = UPPER(p_user) AND is_active = 'Y';
+    RETURN n > 0;
+  END;
+
+  FUNCTION is_site_admin (p_user VARCHAR2, p_site VARCHAR2) RETURN BOOLEAN IS
+    n NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO n FROM app_user_roles
+    WHERE  UPPER(unixid) = UPPER(p_user)
+    AND    is_active = 'Y'
+    AND    role_code = 'ADMIN'
+    AND   (UPPER(site) = UPPER(p_site) OR UPPER(site) IN ('ALL', 'ALL SITES'));
+    RETURN n > 0;
+  END;
+
+  FUNCTION lock_req (p_id NUMBER) RETURN mlr_requests%ROWTYPE IS
+    r mlr_requests%ROWTYPE;
+  BEGIN
+    SELECT * INTO r FROM mlr_requests WHERE id = p_id FOR UPDATE;
+    RETURN r;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+    fail('Leave request ' || p_id || ' was not found.');
+  END;
+
+  -- 'SUPERVISOR' / 'NEXT_LEVEL' / 'ADMIN' / NULL (may not decide)
+  FUNCTION level_for (r mlr_requests%ROWTYPE, p_user VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    IF UPPER(p_user) = UPPER(r.requester) THEN
+      RETURN NULL;                                   -- nobody approves their own leave
+    ELSIF UPPER(p_user) = UPPER(NVL(r.approver1, '-')) THEN
+      RETURN 'SUPERVISOR';
+    ELSIF UPPER(p_user) = UPPER(NVL(r.approver2, '-')) THEN
+      RETURN 'NEXT_LEVEL';                           -- option A: may approve at any time
+    ELSIF NOT has_account(r.approver1) AND NOT has_account(r.approver2)
+          AND is_site_admin(p_user, r.site) THEN
+      RETURN 'ADMIN';                                -- safety net: no approver in the app
+    END IF;
+    RETURN NULL;
+  END;
+
+  PROCEDURE check_times (p_start DATE, p_end DATE, p_st VARCHAR2, p_et VARCHAR2) IS
+  BEGIN
+    IF p_start IS NULL THEN fail('Enter the first day of leave.'); END IF;
+    IF p_end < p_start THEN fail('The last day cannot be before the first day.'); END IF;
+    IF p_st IS NOT NULL AND NOT REGEXP_LIKE(p_st, '^([01][0-9]|2[0-3]):[0-5][0-9]$') THEN
+      fail('Start time must look like 08:00.');
+    END IF;
+    IF p_et IS NOT NULL AND NOT REGEXP_LIKE(p_et, '^([01][0-9]|2[0-3]):[0-5][0-9]$') THEN
+      fail('End time must look like 12:00.');
+    END IF;
+    IF p_et IS NOT NULL AND p_end <> p_start THEN
+      fail('An end time can only be entered for a one-day request.');
+    END IF;
+    IF p_st IS NOT NULL AND p_et IS NOT NULL AND p_et <= p_st THEN
+      fail('The end time must be after the start time.');
+    END IF;
+  END;
+
+  PROCEDURE check_overlap (p_user VARCHAR2, p_start DATE, p_end DATE, p_skip_id NUMBER) IS
+    v_txt VARCHAR2(200);
+  BEGIN
+    SELECT MIN(TO_CHAR(start_date, 'DD-MON-YYYY') || ' to ' || TO_CHAR(end_date, 'DD-MON-YYYY'))
+    INTO   v_txt
+    FROM   mlr_requests
+    WHERE  UPPER(requester) = UPPER(p_user)
+    AND    status IN ('PENDING', 'APPROVED')
+    AND    id <> NVL(p_skip_id, -1)
+    AND    start_date <= p_end
+    AND    end_date   >= p_start;
+    IF v_txt IS NOT NULL THEN
+      fail('You already have leave from ' || v_txt || '. Change that request instead.');
+    END IF;
+  END;
+
+  -- ---------------------------------------------------------------- public checks
+  FUNCTION can_request (p_user VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    FOR r IN (SELECT role_code FROM app_user_roles
+              WHERE  UPPER(unixid) = UPPER(p_user) AND is_active = 'Y')
+    LOOP
+      IF in_list(r.role_code, c_roles) THEN RETURN 'Y'; END IF;
+    END LOOP;
+    RETURN 'N';
+  END;
+
+  FUNCTION is_all_sites (p_user VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    FOR r IN (SELECT role_code FROM app_user_roles
+              WHERE  UPPER(unixid) = UPPER(p_user) AND is_active = 'Y'
+              AND    UPPER(site) IN ('ALL', 'ALL SITES'))
+    LOOP
+      IF in_list(r.role_code, c_roles) THEN RETURN 'Y'; END IF;
+    END LOOP;
+    RETURN 'N';
+  END;
+
+  FUNCTION can_see_site (p_user VARCHAR2, p_site VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN CASE WHEN role_at_site(p_user, p_site) THEN 'Y' ELSE 'N' END;
+  END;
+
+  FUNCTION supervisor_of (p_user VARCHAR2) RETURN VARCHAR2 IS
+    v VARCHAR2(100);
+  BEGIN
+    IF p_user IS NULL THEN RETURN NULL; END IF;
+    SELECT MIN(UPPER(i.supervisor_id)) INTO v
+    FROM   idm_personnel_v i
+    WHERE  UPPER(i.shortname) = UPPER(p_user);
+    RETURN v;
+  END;
+
+  FUNCTION can_decide (p_id NUMBER, p_user VARCHAR2) RETURN VARCHAR2 IS
+    r mlr_requests%ROWTYPE;
+  BEGIN
+    SELECT * INTO r FROM mlr_requests WHERE id = p_id;
+    IF r.status = 'PENDING' AND level_for(r, p_user) IS NOT NULL THEN
+      RETURN 'Y';
+    END IF;
+    RETURN 'N';
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+    RETURN 'N';
+  END;
+
+  -- ---------------------------------------------------------------- actions
+  FUNCTION submit_request (p_user VARCHAR2, p_site VARCHAR2,
+                           p_start DATE, p_end DATE,
+                           p_start_time VARCHAR2, p_end_time VARCHAR2,
+                           p_comment VARCHAR2) RETURN NUMBER IS
+    v_start DATE := TRUNC(p_start);
+    v_end   DATE := TRUNC(NVL(p_end, p_start));
+    v_sup1  VARCHAR2(100);
+    v_sup2  VARCHAR2(100);
+    v_emp   VARCHAR2(20);
+    v_id    NUMBER;
+  BEGIN
+    IF can_request(p_user) = 'N' THEN
+      fail('Your role cannot request leave in this system.');
+    END IF;
+    IF p_site IS NULL THEN fail('Choose the site this leave is for.'); END IF;
+    IF NOT role_at_site(p_user, p_site) THEN
+      fail('You do not have an eligible role at ' || p_site || '.');
+    END IF;
+
+    check_times(v_start, v_end, p_start_time, p_end_time);
+    check_overlap(p_user, v_start, v_end, NULL);
+
+    v_sup1 := supervisor_of(p_user);
+    IF UPPER(v_sup1) = UPPER(p_user) THEN v_sup1 := NULL; END IF;
+    v_sup2 := supervisor_of(v_sup1);
+    IF UPPER(v_sup2) IN (UPPER(p_user), UPPER(v_sup1)) THEN v_sup2 := NULL; END IF;
+
+    SELECT MAX(emplid) INTO v_emp
+    FROM   app_user_roles
+    WHERE  UPPER(unixid) = UPPER(p_user) AND emplid IS NOT NULL;
+
+    INSERT INTO mlr_requests (site, requester, emplid, start_date, end_date, start_time, end_time,
+                              comments, status, approver1, approver2)
+    VALUES (p_site, UPPER(p_user), v_emp, v_start, v_end, p_start_time, p_end_time,
+            TRIM(p_comment), 'PENDING', v_sup1, v_sup2)
+    RETURNING id INTO v_id;
+
+    log_event(v_id, 'SUBMIT', NULL, 'PENDING', p_user,
+              'Approvers: ' || NVL(v_sup1, '-') || ' / ' || NVL(v_sup2, '-'));
+    -- EMAIL (later): notify v_sup1 and v_sup2 here with apex_mail.send
+    RETURN v_id;
+  END;
+
+  PROCEDURE change_request (p_id NUMBER, p_user VARCHAR2,
+                            p_start DATE, p_end DATE,
+                            p_start_time VARCHAR2, p_end_time VARCHAR2,
+                            p_comment VARCHAR2) IS
+    r       mlr_requests%ROWTYPE := lock_req(p_id);
+    v_start DATE := TRUNC(p_start);
+    v_end   DATE := TRUNC(NVL(p_end, p_start));
+    v_sup1  VARCHAR2(100);
+    v_sup2  VARCHAR2(100);
+  BEGIN
+    IF UPPER(r.requester) <> UPPER(p_user) THEN
+      fail('Only the person who requested this leave can change it.');
+    END IF;
+    IF r.status NOT IN ('PENDING', 'APPROVED') THEN
+      fail('Request ' || r.id || ' is ' || r.status || ' and can no longer be changed.');
+    END IF;
+
+    check_times(v_start, v_end, p_start_time, p_end_time);
+    check_overlap(p_user, v_start, v_end, r.id);
+
+    v_sup1 := supervisor_of(p_user);
+    IF UPPER(v_sup1) = UPPER(p_user) THEN v_sup1 := NULL; END IF;
+    v_sup2 := supervisor_of(v_sup1);
+    IF UPPER(v_sup2) IN (UPPER(p_user), UPPER(v_sup1)) THEN v_sup2 := NULL; END IF;
+
+    UPDATE mlr_requests
+    SET    start_date = v_start, end_date = v_end,
+           start_time = p_start_time, end_time = p_end_time,
+           comments = TRIM(p_comment),
+           status = 'PENDING', changed_ts = SYSTIMESTAMP,
+           approver1 = v_sup1, approver2 = v_sup2,
+           decided_by = NULL, decided_level = NULL, decided_ts = NULL, decision_comment = NULL
+    WHERE  id = r.id;
+
+    log_event(r.id, 'CHANGE', r.status, 'PENDING', p_user,
+              TO_CHAR(r.start_date, 'DD-MON-YYYY') || ' - ' || TO_CHAR(r.end_date, 'DD-MON-YYYY')
+              || ' -> ' || TO_CHAR(v_start, 'DD-MON-YYYY') || ' - ' || TO_CHAR(v_end, 'DD-MON-YYYY')
+              || CASE WHEN r.status = 'APPROVED' THEN ' (needs approval again)' END);
+    -- EMAIL (later): notify approvers that a request changed
+  END;
+
+  PROCEDURE cancel_request (p_id NUMBER, p_user VARCHAR2, p_reason VARCHAR2) IS
+    r mlr_requests%ROWTYPE := lock_req(p_id);
+  BEGIN
+    IF UPPER(r.requester) <> UPPER(p_user) AND NOT is_site_admin(p_user, r.site) THEN
+      fail('Only the person who requested this leave (or a site admin) can cancel it.');
+    END IF;
+    IF r.status NOT IN ('PENDING', 'APPROVED') THEN
+      fail('Request ' || r.id || ' is already ' || r.status || '.');
+    END IF;
+
+    UPDATE mlr_requests
+    SET    status = 'CANCELLED', cancelled_by = UPPER(p_user),
+           cancelled_ts = SYSTIMESTAMP, cancel_reason = TRIM(p_reason)
+    WHERE  id = r.id;
+
+    log_event(r.id, 'CANCEL', r.status, 'CANCELLED', p_user, p_reason);
+  END;
+
+  PROCEDURE decide (p_id NUMBER, p_user VARCHAR2, p_decision VARCHAR2, p_comment VARCHAR2) IS
+    r       mlr_requests%ROWTYPE := lock_req(p_id);
+    v_level VARCHAR2(20);
+    v_new   VARCHAR2(20);
+  BEGIN
+    IF r.status <> 'PENDING' THEN
+      fail('Request ' || r.id || ' is ' || r.status || ' and cannot be decided.');
+    END IF;
+
+    v_level := level_for(r, p_user);
+    IF v_level IS NULL THEN
+      fail('You are not an approver for request ' || r.id || '.');
+    END IF;
+
+    IF UPPER(p_decision) = 'APPROVE' THEN
+      v_new := 'APPROVED';
+    ELSIF UPPER(p_decision) = 'REJECT' THEN
+      IF TRIM(p_comment) IS NULL THEN fail('Enter a reason for rejecting.'); END IF;
+      v_new := 'REJECTED';
+    ELSE
+      fail('Decision must be APPROVE or REJECT.');
+    END IF;
+
+    UPDATE mlr_requests
+    SET    status = v_new, decided_by = UPPER(p_user), decided_level = v_level,
+           decided_ts = SYSTIMESTAMP, decision_comment = TRIM(p_comment)
+    WHERE  id = r.id;
+
+    log_event(r.id, UPPER(p_decision), 'PENDING', v_new, p_user,
+              v_level || CASE WHEN TRIM(p_comment) IS NOT NULL THEN ': ' || TRIM(p_comment) END);
+    -- EMAIL (later): notify the requester of the decision
+  END;
+
+END mlr_api;
+/
+
+-- 6. Check: 2 tables, 1 view, package + body - all VALID; errors query returns no rows
+SELECT object_name, object_type, status
+FROM   user_objects
+WHERE  object_name IN ('MLR_REQUESTS', 'MLR_EVENTS', 'MLR_CALENDAR_V', 'MLR_API')
+ORDER  BY object_type, object_name;
+
+SELECT name, type, line, position, text
+FROM   user_errors
+WHERE  name IN ('MLR_API', 'MLR_CALENDAR_V')
+ORDER  BY name, type, sequence;
+
+-- END OF FILE mlr_phase1.sql

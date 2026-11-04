@@ -1,107 +1,50 @@
-Step 3: Region "Waiting for My Approval" (Classic Report)
+DECLARE
+  c_card CONSTANT VARCHAR2(400) :=
+    'cursor:pointer; width:180px; background:#ffffff; border-radius:10px; ' ||
+    'box-shadow:0 2px 8px rgba(0,0,0,0.1); padding:24px 16px; text-align:center; border-top:4px solid ';
+  c_color CONSTANT VARCHAR2(10) := '#14b8a6';
+  v      CLOB;
+  n      NUMBER;
+  v_sup  NUMBER;
 
-	•	Static ID: mlr_pending
-	•	When No Data Found: Nothing waiting for your approval.
-
-SELECT r.id AS request_no,
-       NVL((SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
-            WHERE  UPPER(i.shortname) = r.requester), r.requester) AS employee,
-       r.site,
-       r.start_date AS first_day,
-       r.end_date   AS last_day,
-       r.end_date - r.start_date + 1 AS days,
-       CASE WHEN r.start_time IS NULL AND r.end_time IS NULL THEN 'Full day'
-            WHEN r.end_time IS NOT NULL THEN r.start_time || ' - ' || r.end_time
-            ELSE 'From ' || r.start_time || ' on first day' END AS hours,
-       r.comments,
-       r.submitted_ts AS submitted,
-       CASE WHEN UPPER(:APP_USER) = r.approver1 THEN 'My team'
-            WHEN UPPER(:APP_USER) = r.approver2 THEN 'Next level'
-            ELSE 'Site admin' END AS approve_as,
-       '<button type="button" class="t-Button t-Button--small t-Button--success mlr-decide" data-id="' || r.id || '" data-act="APPROVE">Approve</button> ' ||
-       '<button type="button" class="t-Button t-Button--small t-Button--danger mlr-decide" data-id="' || r.id || '" data-act="REJECT">Reject</button>' AS actions
-FROM   mlr_requests r
-WHERE  r.status = 'PENDING'
-AND    mlr_api.can_decide(r.id, :APP_USER) = 'Y'
-ORDER  BY r.start_date, r.submitted_ts
-
-
-ACTIONS: Heading Actions, Escape special characters Off
-
-Step 4: Region "Decided by Me" (Interactive Report)
-
-
-SELECT r.id AS request_no,
-       NVL((SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
-            WHERE  UPPER(i.shortname) = r.requester), r.requester) AS employee,
-       r.site,
-       r.start_date AS first_day,
-       r.end_date   AS last_day,
-       r.status,
-       r.decided_level,
-       r.decided_ts AS decided,
-       r.decision_comment
-FROM   mlr_requests r
-WHERE  r.decided_by = UPPER(:APP_USER)
-AND    r.decided_ts > SYSTIMESTAMP - INTERVAL '90' DAY
-ORDER  BY r.decided_ts DESC
-
-
-Step 5: Dynamic Action "Approve / Reject"
-
-	1.	Dynamic Actions tab → right-click Events → Create Dynamic Action
-	2.	Set:
-	•	Name: Approve / Reject
-	•	When → Event: Click · Selection Type jQuery Selector · jQuery Selector .mlr-decide
-	•	Execution → Event Scope: Dynamic
-	3.	True action: Execute JavaScript Code, Fire on Initialization Off:
-
-
-var b   = this.triggeringElement;
-var id  = b.dataset.id;
-var act = b.dataset.act;
-var note;
-
-if (act === 'REJECT') {
-  note = window.prompt('Reject leave request ' + id + '. Reason (required):', '');
-  if (note === null) { return; }
-  if (!note.trim()) { apex.message.alert('A reason is required to reject.'); return; }
-} else {
-  note = window.prompt('Approve leave request ' + id + '? Comment (optional):', '');
-  if (note === null) { return; }
-}
-apex.page.submit({ request: act, set: { 'P43_ID': id, 'P43_COMMENT': note }, showWait: true });
-
-
-Step 6: Processing
-
-Process "Decide": right-click Processing → Create Process:
-
-	•	Type Execute Code · Server-side Condition: Request is contained in Value · APPROVE,REJECT
-
+  FUNCTION card (p_page NUMBER, p_icon VARCHAR2, p_title VARCHAR2, p_sub VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN '<div onclick="apex.navigation.redirect(''' || apex_page.get_url(p_page => p_page) || ''')"'
+        || ' style="' || c_card || c_color || ';">'
+        || '<div style="font-size:36px;"><span class="fa ' || p_icon || '"></span></div>'
+        || '<div style="margin-top:10px; font-weight:bold; font-size:13px;">' || p_title || '</div>'
+        || '<div style="font-size:11px; color:#9ca3af; margin-top:4px;">' || p_sub || '</div></div>';
+  END;
 BEGIN
-  mlr_api.decide(:P43_ID, :APP_USER, :REQUEST, :P43_COMMENT);
-  apex_application.g_print_success_message :=
-    'Leave request ' || :P43_ID || CASE :REQUEST WHEN 'APPROVE' THEN ' approved.' ELSE ' rejected.' END;
+  IF mlr_api.can_request(:APP_USER) = 'N' THEN
+    RETURN NULL;                         -- floor operators, inspectors, union: no Leave section
+  END IF;
+
+  v := '<div style="display:flex; flex-wrap:wrap; gap:20px; padding:0 20px 20px 20px;">'
+    || '<div style="width:100%; margin-top:24px; margin-bottom:16px;">'
+    || '<div style="font-size:13px; font-weight:700; color:#333; text-transform:uppercase; letter-spacing:1px;">Manager Leave</div>'
+    || '<div style="height:3px; width:60px; background:' || c_color || '; margin-top:6px; border-radius:2px;"></div></div>';
+
+  -- My Leave Requests: my pending count
+  SELECT COUNT(*) INTO n FROM mlr_requests
+  WHERE  requester = UPPER(:APP_USER) AND status = 'PENDING';
+  v := v || card(41, 'fa-calendar-plus-o', 'My Leave Requests',
+                 CASE WHEN n = 0 THEN 'Request time off' ELSE n || ' waiting for approval' END);
+
+  -- Leave Approvals: only for people who supervise someone, or have something to decide
+  SELECT COUNT(*) INTO v_sup FROM idm_personnel_v
+  WHERE  UPPER(supervisor_id) = UPPER(:APP_USER) AND ROWNUM = 1;
+
+  SELECT COUNT(*) INTO n FROM mlr_requests r
+  WHERE  r.status = 'PENDING' AND mlr_api.can_decide(r.id, :APP_USER) = 'Y';
+
+  IF v_sup > 0 OR n > 0 THEN
+    v := v || card(43, 'fa-check-circle-o', 'Leave Approvals',
+                   CASE WHEN n = 0 THEN 'Nothing waiting' ELSE n || ' to approve' END);
+  END IF;
+
+  -- Manager Calendar (Page 44): un-comment these two lines once Page 44 is built
+  -- v := v || card(44, 'fa-calendar', 'Manager Calendar', 'Who is off');
+
+  RETURN v || '</div>';
 END;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

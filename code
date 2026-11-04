@@ -1,136 +1,103 @@
-P42_SITE list of values:
-SELECT DISTINCT a.site AS d, a.site AS r
-FROM   app_user_roles a
-WHERE  a.is_active = 'Y'
-AND    UPPER(a.site) NOT IN ('ALL', 'ALL SITES')
-AND    mlr_api.can_see_site(:APP_USER, a.site) = 'Y'
-ORDER  BY 1
+Step 3: Region "Waiting for My Approval" (Classic Report)
 
+	•	Static ID: mlr_pending
+	•	When No Data Found: Nothing waiting for your approval.
 
-Times list of values (for both P42_START_TIME and P42_END_TIME), every 30 minutes:
-
-SELECT TO_CHAR(DATE '2000-01-01' + (LEVEL - 1) / 48, 'HH:MI AM') AS d,
-       TO_CHAR(DATE '2000-01-01' + (LEVEL - 1) / 48, 'HH24:MI')  AS r
-FROM   dual
-CONNECT BY LEVEL <= 48
-
-
-	•	Client-side Condition: JavaScript Expression
-
-!$v('P42_END_DATE') || $v('P42_END_DATE') === $v('P42_START_DATE')
-
-
-•	Server-side Condition: PL/SQL Expression :REQUEST IS NULL OR :REQUEST <> 'SAVE'
-
-DECLARE
-  r       mlr_requests%ROWTYPE;
-  v_site  VARCHAR2(100);
-  v_count NUMBER;
-BEGIN
-  IF :P42_ID IS NOT NULL THEN
-    SELECT * INTO r FROM mlr_requests WHERE id = :P42_ID;
-    IF UPPER(r.requester) <> UPPER(:APP_USER) THEN
-      RAISE_APPLICATION_ERROR(-20200, 'You can only change your own leave requests.');
-    END IF;
-    IF r.status NOT IN ('PENDING', 'APPROVED') THEN
-      RAISE_APPLICATION_ERROR(-20200, 'Request ' || r.id || ' is ' || r.status || ' and can no longer be changed.');
-    END IF;
-    :P42_SITE       := r.site;
-    :P42_START_DATE := TO_CHAR(r.start_date, 'DD-MON-YYYY');
-    :P42_END_DATE   := CASE WHEN r.end_date > r.start_date THEN TO_CHAR(r.end_date, 'DD-MON-YYYY') END;
-    :P42_START_TIME := r.start_time;
-    :P42_END_TIME   := r.end_time;
-    :P42_COMMENT    := r.comments;
-  ELSIF :P42_SITE IS NULL THEN
-    SELECT MIN(a.site), COUNT(DISTINCT UPPER(a.site)) INTO v_site, v_count
-    FROM   app_user_roles a
-    WHERE  a.is_active = 'Y'
-    AND    UPPER(a.site) NOT IN ('ALL', 'ALL SITES')
-    AND    mlr_api.can_see_site(:APP_USER, a.site) = 'Y';
-    IF v_count = 1 THEN :P42_SITE := v_site; END IF;   -- one site: pick it automatically
-  END IF;
-EXCEPTION
-  WHEN NO_DATA_FOUND THEN
-    RAISE_APPLICATION_ERROR(-20200, 'Leave request ' || :P42_ID || ' was not found.');
-END;
-
-
-
-Process "Save Request" (seq 10, When Button Pressed SAVE):
-
-
-
-DECLARE
-  v_id NUMBER;
-BEGIN
-  IF :P42_ID IS NULL THEN
-    v_id := mlr_api.submit_request(:APP_USER, :P42_SITE,
-                                   TO_DATE(:P42_START_DATE, 'DD-MON-YYYY'),
-                                   TO_DATE(:P42_END_DATE,   'DD-MON-YYYY'),
-                                   :P42_START_TIME, :P42_END_TIME, :P42_COMMENT);
-    apex_application.g_print_success_message := 'Leave request ' || v_id || ' sent to your supervisor.';
-  ELSE
-    mlr_api.change_request(:P42_ID, :APP_USER,
-                           TO_DATE(:P42_START_DATE, 'DD-MON-YYYY'),
-                           TO_DATE(:P42_END_DATE,   'DD-MON-YYYY'),
-                           :P42_START_TIME, :P42_END_TIME, :P42_COMMENT);
-    apex_application.g_print_success_message := 'Leave request ' || :P42_ID || ' changed and sent for approval again.';
-  END IF;
-END;
-
-
-
-Region "My Requests" (Interactive Report)
-
-
-SELECT r.id                     AS request_no,
+SELECT r.id AS request_no,
+       NVL((SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
+            WHERE  UPPER(i.shortname) = r.requester), r.requester) AS employee,
        r.site,
-       r.start_date             AS first_day,
-       r.end_date               AS last_day,
+       r.start_date AS first_day,
+       r.end_date   AS last_day,
        r.end_date - r.start_date + 1 AS days,
        CASE WHEN r.start_time IS NULL AND r.end_time IS NULL THEN 'Full day'
             WHEN r.end_time IS NOT NULL THEN r.start_time || ' - ' || r.end_time
             ELSE 'From ' || r.start_time || ' on first day' END AS hours,
        r.comments,
-       r.status,
-       NVL((SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
-            WHERE  UPPER(i.shortname) = r.approver1), r.approver1) AS supervisor,
-       r.decided_by,
-       r.decided_ts             AS decided,
-       r.decision_comment,
-       r.id                     AS change_link,
-       CASE WHEN r.status IN ('PENDING', 'APPROVED') THEN
-         '<button type="button" class="t-Button t-Button--small t-Button--danger mlr-cancel" data-id="' || r.id || '">Cancel</button>'
-       END                      AS cancel_btn
+       r.submitted_ts AS submitted,
+       CASE WHEN UPPER(:APP_USER) = r.approver1 THEN 'My team'
+            WHEN UPPER(:APP_USER) = r.approver2 THEN 'Next level'
+            ELSE 'Site admin' END AS approve_as,
+       '<button type="button" class="t-Button t-Button--small t-Button--success mlr-decide" data-id="' || r.id || '" data-act="APPROVE">Approve</button> ' ||
+       '<button type="button" class="t-Button t-Button--small t-Button--danger mlr-decide" data-id="' || r.id || '" data-act="REJECT">Reject</button>' AS actions
 FROM   mlr_requests r
-WHERE  UPPER(r.requester) = UPPER(:APP_USER)
-ORDER  BY r.start_date DESC
+WHERE  r.status = 'PENDING'
+AND    mlr_api.can_decide(r.id, :APP_USER) = 'Y'
+ORDER  BY r.start_date, r.submitted_ts
 
 
-	•	Link Text: <span class="fa fa-pencil" aria-hidden="true"></span>
-	•	Link Attributes: class="mlr-edit-#STATUS#" title="Change request #REQUEST_NO#"
-	•	CANCEL_BTN: Heading blank, Escape special characters Off
+ACTIONS: Heading Actions, Escape special characters Off
 
-Page → CSS → Inline. This hides the pencil on requests that can't be changed anymore:
-
-.mlr-edit-REJECTED, .mlr-edit-CANCELLED { display: none; }
-
-Dynamic Actions
-
-"Cancel Leave": Event Click · jQuery Selector .mlr-cancel · Event Scope Dynamic → Execute JavaScript Code:
-
-var id = this.triggeringElement.dataset.id;
-var reason = window.prompt('Cancel leave request ' + id + '? Reason (optional):', '');
-if (reason === null) { return; }
-apex.page.submit({ request: 'CANCEL_LEAVE', set: { 'P41_ID': id, 'P41_REASON': reason }, showWait: true });
+Step 4: Region "Decided by Me" (Interactive Report)
 
 
-Process "Cancel Leave" (When Request = Value CANCEL_LEAVE):
+SELECT r.id AS request_no,
+       NVL((SELECT MIN(i.last_name || ', ' || i.first_name) FROM idm_personnel_v i
+            WHERE  UPPER(i.shortname) = r.requester), r.requester) AS employee,
+       r.site,
+       r.start_date AS first_day,
+       r.end_date   AS last_day,
+       r.status,
+       r.decided_level,
+       r.decided_ts AS decided,
+       r.decision_comment
+FROM   mlr_requests r
+WHERE  r.decided_by = UPPER(:APP_USER)
+AND    r.decided_ts > SYSTIMESTAMP - INTERVAL '90' DAY
+ORDER  BY r.decided_ts DESC
+
+
+Step 5: Dynamic Action "Approve / Reject"
+
+	1.	Dynamic Actions tab → right-click Events → Create Dynamic Action
+	2.	Set:
+	•	Name: Approve / Reject
+	•	When → Event: Click · Selection Type jQuery Selector · jQuery Selector .mlr-decide
+	•	Execution → Event Scope: Dynamic
+	3.	True action: Execute JavaScript Code, Fire on Initialization Off:
+
+
+var b   = this.triggeringElement;
+var id  = b.dataset.id;
+var act = b.dataset.act;
+var note;
+
+if (act === 'REJECT') {
+  note = window.prompt('Reject leave request ' + id + '. Reason (required):', '');
+  if (note === null) { return; }
+  if (!note.trim()) { apex.message.alert('A reason is required to reject.'); return; }
+} else {
+  note = window.prompt('Approve leave request ' + id + '? Comment (optional):', '');
+  if (note === null) { return; }
+}
+apex.page.submit({ request: act, set: { 'P43_ID': id, 'P43_COMMENT': note }, showWait: true });
+
+
+Step 6: Processing
+
+Process "Decide": right-click Processing → Create Process:
+
+	•	Type Execute Code · Server-side Condition: Request is contained in Value · APPROVE,REJECT
 
 BEGIN
-  mlr_api.cancel_request(:P41_ID, :APP_USER, :P41_REASON);
-  apex_application.g_print_success_message := 'Leave request ' || :P41_ID || ' cancelled.';
+  mlr_api.decide(:P43_ID, :APP_USER, :REQUEST, :P43_COMMENT);
+  apex_application.g_print_success_message :=
+    'Leave request ' || :P43_ID || CASE :REQUEST WHEN 'APPROVE' THEN ' approved.' ELSE ' rejected.' END;
 END;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

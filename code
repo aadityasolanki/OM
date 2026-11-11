@@ -1,85 +1,28 @@
-SELECT DISTINCT a.site AS d, a.site AS r
-FROM   app_user_roles a
-WHERE  a.is_active = 'Y'
-AND    UPPER(a.site) NOT IN ('ALL', 'ALL SITES')
-AND    mlr_api.can_see_site(:APP_USER, a.site) = 'Y'
-ORDER  BY 1
-
-
-Pre-Rendering → Before Header → Process "Default Site", Server-side Condition Item is NULL → P44_SITE:
-
-SELECT MIN(a.site) INTO :P44_SITE
-FROM   app_user_roles a
-WHERE  a.is_active = 'Y'
-AND    UPPER(a.site) NOT IN ('ALL', 'ALL SITES')
-AND    UPPER(a.site) IN (SELECT UPPER(x.site) FROM app_user_roles x
-                         WHERE  UPPER(x.unixid) = UPPER(:APP_USER) AND x.is_active = 'Y')
-AND    mlr_api.can_see_site(:APP_USER, a.site) = 'Y';
-
-IF :P44_SITE IS NULL THEN          -- ALL-sites users with no own site: first site in the list
-  SELECT MIN(a.site) INTO :P44_SITE
-  FROM   app_user_roles a
-  WHERE  a.is_active = 'Y' AND UPPER(a.site) NOT IN ('ALL', 'ALL SITES');
-END IF;
-
-
-	•	Name: Who Is Off · Type: Calendar · Static ID: mlr_cal
-
 SELECT c.id,
-       c.person_name || CASE WHEN c.status = 'PENDING' THEN ' (pending)' END AS title,
+       c.person_name ||
+       CASE WHEN c.all_day = 'Y' THEN NULL
+            WHEN c.start_time IS NULL THEN
+                 ' (until ' || TO_CHAR(TO_DATE(c.end_time, 'HH24:MI'), 'FMHH:MI AM') || ')'
+            WHEN c.end_time IS NOT NULL THEN
+                 ' (' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ' - '
+                      || TO_CHAR(TO_DATE(c.end_time,   'HH24:MI'), 'FMHH:MI AM') || ')'
+            WHEN c.start_date = c.end_date THEN
+                 ' (from ' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ')'
+            ELSE ' (from ' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM')
+                           || ' on ' || TO_CHAR(c.start_date, 'DD-MON') || ')'
+       END ||
+       CASE WHEN c.status = 'PENDING' THEN ' - pending' END AS title,
        c.cal_start,
-       c.cal_end,
+       CASE WHEN c.all_day = 'Y' THEN c.cal_end + 1 ELSE c.cal_end END AS cal_end,
        CASE c.status WHEN 'APPROVED' THEN 'apex-cal-green' ELSE 'apex-cal-silver mlr-pending' END AS css_class,
        c.person_name || ' - ' ||
        CASE WHEN c.all_day = 'Y' THEN 'Full day'
-            WHEN c.end_time IS NOT NULL THEN c.start_time || ' to ' || c.end_time
-            ELSE 'From ' || c.start_time || ' on ' || TO_CHAR(c.start_date, 'DD-MON') END ||
+            WHEN c.start_time IS NULL THEN 'Until ' || TO_CHAR(TO_DATE(c.end_time, 'HH24:MI'), 'FMHH:MI AM')
+            WHEN c.end_time IS NOT NULL THEN TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ' to '
+                                          || TO_CHAR(TO_DATE(c.end_time,   'HH24:MI'), 'FMHH:MI AM')
+            ELSE 'From ' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ' on ' || TO_CHAR(c.start_date, 'DD-MON')
+       END ||
        CASE WHEN c.status = 'PENDING' THEN ' (waiting for approval)' END AS info
 FROM   mlr_calendar_v c
 WHERE  UPPER(c.site) = UPPER(:P44_SITE)
 AND    mlr_api.can_see_site(:APP_USER, c.site) = 'Y'
-
-Source → Page Items to Submit: P44_SITE
-
-Step 4: Page CSS (fades pending leave)
-
-.mlr-pending { opacity: 0.55; font-style: italic; }
-
-
-Step 5: Dynamic Action "Change Site"
-
-	•	Event: Change · Item P44_SITE
-	•	True action: Refresh · Region Who Is Off
-
-Step 6 (optional but handy): "Off Today" list
-
-Right-click Filter → Create Region Below, Type Classic Report, Name Off Today, and set Page Items to Submit to P44_SITE:
-
-
-SELECT c.person_name AS name,
-       CASE WHEN c.all_day = 'Y' THEN 'Full day'
-            WHEN c.end_time IS NOT NULL THEN c.start_time || ' - ' || c.end_time
-            WHEN TRUNC(SYSDATE) = c.start_date THEN 'From ' || c.start_time
-            ELSE 'Full day' END AS hours,
-       c.end_date AS back_after,
-       c.status
-FROM   mlr_calendar_v c
-WHERE  UPPER(c.site) = UPPER(:P44_SITE)
-AND    mlr_api.can_see_site(:APP_USER, c.site) = 'Y'
-AND    TRUNC(SYSDATE) BETWEEN c.start_date AND c.end_date
-ORDER  BY c.person_name
-
-
-
-
-Step 7: Turn on the home card
-
-
-  v := v || card(44, 'fa-calendar', 'Manager Calendar', 'Who is off');
-
-
-
-
-
-
-

@@ -1,28 +1,77 @@
-SELECT c.id,
-       c.person_name ||
-       CASE WHEN c.all_day = 'Y' THEN NULL
-            WHEN c.start_time IS NULL THEN
-                 ' (until ' || TO_CHAR(TO_DATE(c.end_time, 'HH24:MI'), 'FMHH:MI AM') || ')'
-            WHEN c.end_time IS NOT NULL THEN
-                 ' (' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ' - '
-                      || TO_CHAR(TO_DATE(c.end_time,   'HH24:MI'), 'FMHH:MI AM') || ')'
-            WHEN c.start_date = c.end_date THEN
-                 ' (from ' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ')'
-            ELSE ' (from ' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM')
-                           || ' on ' || TO_CHAR(c.start_date, 'DD-MON') || ')'
-       END ||
-       CASE WHEN c.status = 'PENDING' THEN ' - pending' END AS title,
-       c.cal_start,
-       CASE WHEN c.all_day = 'Y' THEN c.cal_end + 1 ELSE c.cal_end END AS cal_end,
-       CASE c.status WHEN 'APPROVED' THEN 'apex-cal-green' ELSE 'apex-cal-silver mlr-pending' END AS css_class,
-       c.person_name || ' - ' ||
-       CASE WHEN c.all_day = 'Y' THEN 'Full day'
-            WHEN c.start_time IS NULL THEN 'Until ' || TO_CHAR(TO_DATE(c.end_time, 'HH24:MI'), 'FMHH:MI AM')
-            WHEN c.end_time IS NOT NULL THEN TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ' to '
-                                          || TO_CHAR(TO_DATE(c.end_time,   'HH24:MI'), 'FMHH:MI AM')
-            ELSE 'From ' || TO_CHAR(TO_DATE(c.start_time, 'HH24:MI'), 'FMHH:MI AM') || ' on ' || TO_CHAR(c.start_date, 'DD-MON')
-       END ||
-       CASE WHEN c.status = 'PENDING' THEN ' (waiting for approval)' END AS info
-FROM   mlr_calendar_v c
-WHERE  UPPER(c.site) = UPPER(:P44_SITE)
-AND    mlr_api.can_see_site(:APP_USER, c.site) = 'Y'
+GDLS OMS - App 260 - Database objects to move to production
+Source schema: GD_SANDBOX
+Listed in creation order (later objects depend on earlier ones).
+
+1. EXTERNAL DEPENDENCY (must exist in production first)
+- IDM_PERSONNEL_V   synonym/view to GD_APEX (HR data, read-only). Needs SELECT grant.
+
+2. IDENTITY / USERS
+- APP_ROLES                    table
+- APP_USER_ROLES               table (master user table)
+- USERS                        table (legacy, still required by training)
+- TRG_SYNC_USERS_FROM_ROLES    trigger on APP_USER_ROLES
+
+3. TRAINING MATRIX
+- TRAINING_MACHINES            table
+- TRAINING_PARTS               table
+- TRAINING_SKILLS              table
+- TRAINING_MACHINE_SKILLS      table
+- TRAINING_SESSIONS            table
+- TRAINING_SESSION_PARTS       table
+- TRAINING_SESSION_SKILLS      table
+
+4. VEHICLE & EQUIPMENT QUALIFICATION
+- VEH_EQUIPMENT_CATEGORIES     table
+- VEH_EQUIPMENT_LEVELS         table
+- VEH_GDAO_PERMITS             table
+- VEH_DRIVER_LICENSES          table
+- VEH_QUALIFICATIONS           table
+- VEH_QUAL_ATTACHMENTS         table (ON DELETE CASCADE to VEH_QUALIFICATIONS)
+
+5. INSPECTION & FORKLIFT (scripts: insp_phase1_tables.sql, mq_load_report.sql, insp_api_package.sql)
+- MQ_LOAD_LOG                  table
+- MQ_MATERIAL_QUEUE            table
+- INSP_TICKETS                 table
+- INSP_TICKET_LINES            table
+- INSP_ATTACHMENTS             table
+- FL_EXTRA_LOCATIONS           table
+- FL_TICKETS                   table
+- INSP_EVENTS                  table
+- INSP_COMMENTS                table
+- FL_LOCATIONS_V               view
+- FL_ELIGIBLE_DRIVERS_V        view
+- UQ_INSP_INSPECTOR_PRIORITY   unique index
+- TRG_INSP_PRIORITY_LOCK       trigger
+- MQ_TO_N                      function
+- MQ_TO_DT                     function
+- MQ_LOAD_REPORT               procedure
+- INSP_API                     package + package body
+
+6. MANAGER LEAVE (script: mlr_phase1.sql)
+- MLR_REQUESTS                 table
+- MLR_EVENTS                   table
+- MLR_CALENDAR_V               view
+- MLR_API                      package + package body
+
+7. CERTIFICATIONS / HR / SUPPORT HOURS (pages 2-13, 17)
+- Original tables from before this build; list them from user_objects in GD_SANDBOX.
+
+DO NOT MOVE (unused / abandoned)
+- APP_SITES
+- TRAINING_RECORDS, TRAINING_RECORD_PARTS (old design, replaced by TRAINING_SESSIONS)
+
+NOTES
+- All primary keys are NUMBER GENERATED ALWAYS AS IDENTITY.
+- Recompile packages after tables/views exist; all objects must be VALID.
+- Reference data to copy: APP_ROLES, APP_USER_ROLES, TRAINING_MACHINES,
+  TRAINING_PARTS, TRAINING_SKILLS, VEH_EQUIPMENT_CATEGORIES, VEH_EQUIPMENT_LEVELS,
+  FL_EXTRA_LOCATIONS.
+- Test data (inspection tickets, forklift moves, leave requests) should NOT be copied.
+- App 260 export (APEX application) is moved separately.
+
+Full check of what exists in GD_SANDBOX:
+SELECT object_type, object_name, status
+FROM   user_objects
+WHERE  object_type IN ('TABLE','VIEW','TRIGGER','PACKAGE','PACKAGE BODY',
+                       'PROCEDURE','FUNCTION','SYNONYM','INDEX')
+ORDER  BY object_type, object_name;
